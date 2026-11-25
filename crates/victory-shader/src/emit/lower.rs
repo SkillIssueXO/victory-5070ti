@@ -2361,7 +2361,15 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let id = self.compute_id("groupId.i32", 94, c);
+                if c != 0 || !self.can_offset_group_x() {
+                    return id;
+                }
+                let Val::I32(id) = id else { unreachable!() };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base));
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2424,6 +2432,14 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Only X-only compute shaders with room in user data can be split.
+    fn can_offset_group_x(&self) -> bool {
+        let words = self.x.native.layout.iter().map(|entry| u32::from(entry.user_data) + entry.sgprs).max().unwrap_or(0);
+        matches!(self.x.native.io, StageIo::Cs(_))
+            && !self.x.io.inputs.iter().any(|(_, input)| matches!(input, Input::GroupId(1 | 2)))
+            && words <= 20 && !crate::spill::is_spilled(self.x.native)
     }
 
     /// A component of a compute thread or group id, read in the entry block.

@@ -70,6 +70,9 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
 
+/// Host-provided offset of the first X group in one part of a split dispatch.
+pub const USER_GROUP_BASE: u32 = 0x104;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
