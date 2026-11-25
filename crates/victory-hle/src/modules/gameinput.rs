@@ -1152,11 +1152,18 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                let keys: Vec<_> = scripted().into_iter().map(|virtual_key| KeyState {
+                    virtual_key,
+                    ..Default::default()
+                }).collect();
+                let scripted_pad = fallback(&keys);
+                pad.buttons |= scripted_pad.buttons;
+                pad.left_trigger = pad.left_trigger.max(scripted_pad.left_trigger);
+                pad.right_trigger = pad.right_trigger.max(scripted_pad.right_trigger);
+                pad.left_x = (pad.left_x + scripted_pad.left_x).clamp(-1.0, 1.0);
+                pad.left_y = (pad.left_y + scripted_pad.left_y).clamp(-1.0, 1.0);
+                pad.right_x = (pad.right_x + scripted_pad.right_x).clamp(-1.0, 1.0);
+                pad.right_y = (pad.right_y + scripted_pad.right_y).clamp(-1.0, 1.0);
             }
             Some(pad)
         }
@@ -1198,43 +1205,108 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
+    type KeyScript = Vec<(std::ops::Range<Duration>, u8)>;
+
+    #[cfg(feature = "diagnostics")]
+    fn parse_keys(text: &str) -> KeyScript {
+        text.split([',', '\n']).filter_map(|entry| {
+            let mut fields = entry.splitn(3, ':');
+            let at = Duration::try_from_secs_f64(fields.next()?.trim().parse().ok()?).ok()?;
+            let key = fields.next()?.trim();
+            let vk = match key {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            let hold = match fields.next() {
+                Some(hold) => Duration::try_from_secs_f64(hold.trim().parse().ok()?).ok()?,
+                None => Duration::from_millis(200),
+            };
+            Some((at..at.checked_add(hold)?, vk))
+        }).collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn keys_at(keys: &KeyScript, elapsed: Duration) -> impl Iterator<Item = u8> + '_ {
+        keys.iter().filter(move |(range, _)| range.contains(&elapsed)).map(|(_, vk)| *vk)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    struct LiveKeys {
+        path: std::path::PathBuf,
+        next_read: Instant,
+        started: Instant,
+        text: String,
+        keys: KeyScript,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl LiveKeys {
+        fn poll(&mut self, now: Instant) {
+            if now < self.next_read {
+                return;
+            }
+            self.next_read = now + Duration::from_millis(100);
+            if let Ok(text) = std::fs::read_to_string(&self.path)
+                && text != self.text
+            {
+                self.keys = parse_keys(&text);
+                self.text = text;
+                self.started = now;
+                tracing::info!(keys = self.keys.len(), "playthrough input batch loaded");
+            }
+        }
+    }
+
+    /// `VICTORY_KEYS` entries use `delay:key[:hold]` in seconds from
+    /// startup. The same format in `VICTORY_KEYS_FILE` is relative to the
+    /// moment the file's contents change. Either works without focus.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, KeyScript)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_keys(&list))
+        });
+        static LIVE: LazyLock<Option<Mutex<LiveKeys>>> = LazyLock::new(|| {
+            let path = std::env::var_os("VICTORY_KEYS_FILE")?.into();
+            let now = Instant::now();
+            Some(Mutex::new(LiveKeys {
+                path, next_read: now, started: now, text: String::new(), keys: Vec::new(),
+            }))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut down: Vec<u8> = keys_at(keys, start.elapsed()).collect();
+        if let Some(live) = &*LIVE {
+            let mut live = live.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            live.poll(now);
+            down.extend(keys_at(&live.keys, now.duration_since(live.started)));
+            down.sort_unstable();
+            down.dedup();
+        }
+        down
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn scripted_holds_keep_a_button_down_across_polls() {
+        let keys = parse_keys("# first batch\n0:Z:3,0.25:Enter:2,1:W,invalid");
+        let at = |ms| keys_at(&keys, Duration::from_millis(ms)).collect::<Vec<_>>();
+        assert_eq!(at(249), [b'Z']);
+        assert_eq!(at(1100), [b'Z', 0x0D, b'W']);
+        assert_eq!(at(1500), [b'Z', 0x0D]);
+        assert_eq!(at(2250), [b'Z']);
+        assert!(at(3000).is_empty());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
