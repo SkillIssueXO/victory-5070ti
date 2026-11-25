@@ -30,6 +30,8 @@ mod drvwatch;
 mod draw;
 pub mod dxgi;
 pub mod fence;
+#[cfg(windows)]
+mod fpsbox;
 pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
@@ -69,9 +71,17 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use host::set_fallback_window_input_handler;
+#[cfg(windows)]
+mod window_mode;
+#[cfg(windows)]
+pub use window_mode::window_mode_message;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
