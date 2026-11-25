@@ -21,6 +21,11 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+mod pc;
+#[cfg(windows)]
+#[path = "gameinput/pc_mouse.rs"]
+pub(super) mod pc_mouse;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -111,6 +116,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// State of the optional PC layout, or None for the classic layout.
+    fn pc_mode(&self) -> Option<pc::Mode> {
+        None
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -320,6 +329,7 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    pc: pc::Controls,
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -366,6 +376,7 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
+                pc: Default::default(),
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -401,12 +412,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, pc_mode) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.pc_mode())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, pc_mode);
         self.deliver(events);
     }
 
@@ -451,6 +462,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        pc_mode: Option<pc::Mode>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,10 +470,28 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = if let Some(mut mode) = pc_mode {
+            mode.focused &= !any_pad;
+            self.pc.poll(mode, &keys);
+            if any_pad {
+                pc::discard_mouse();
+            }
+            (!any_pad).then(|| Value::Pad(self.pc.output))
+        } else {
+            (!any_pad).then(|| Value::Pad(fallback(&keys)))
+        };
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
+    }
+
+    /// Publish the PC sample before either kind of forward gamepad read.
+    fn refresh_pc(&mut self, devices: &[Device; DEVICES]) {
+        if self.pc.refresh(Instant::now()) {
+            let output = self.pc.output;
+            // Only updates an existing, connected fallback device.
+            self.update(devices, FALLBACK, Some(Value::Pad(output)), now(), &mut Vec::new());
+        }
     }
 
     /// Records a device's state: a reading when it changed, callbacks when
@@ -512,6 +542,12 @@ impl State {
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
+    if pc_mouse::enabled() {
+        victory_gpu::set_fallback_window_input_handler(|hwnd, message, wparam, lparam| {
+            pc_mouse::window_message(hwnd as _, message, wparam, lparam)
+        });
+        tracing::info!(driving = pc_mouse::driving(), "PC keyboard and mouse profile enabled");
+    }
     Box::new(host::Host::default())
 }
 
@@ -593,7 +629,13 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
+    if kind & GAMEPAD_KIND != 0
+        && (device.is_null() || std::ptr::eq(device, &hub.devices[FALLBACK]))
+        && !out.is_null()
+    {
+        state.refresh_pc(&hub.devices);
+    }
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -645,7 +687,10 @@ fn relative(
     if !device.is_null() && !std::ptr::eq(device, reference.device) {
         return fail(out, E_INVALIDARG);
     }
-    let state = hub.state();
+    let mut state = hub.state();
+    if forward && index == FALLBACK && kind & GAMEPAD_KIND != 0 && !out.is_null() {
+        state.refresh_pc(&hub.devices);
+    }
     let history = &state.slots[index].history;
     if history
         .front()
@@ -1013,10 +1058,25 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
+    let reading = reading(this);
+    match &reading.value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
+            #[cfg(all(windows, feature = "diagnostics"))]
+            if tracing::enabled!(tracing::Level::DEBUG) && pc_mouse::enabled() {
+                // SAFETY: the reading always points to a live hub device.
+                let device = unsafe { &*reading.device };
+                if device.index == FALLBACK {
+                    static LAST: AtomicU32 = AtomicU32::new(0);
+                    let left = state.left_trigger > 0.0;
+                    let right = state.right_trigger > 0.0;
+                    let mask = u32::from(left) | (u32::from(right) << 1);
+                    if LAST.swap(mask, Ordering::Relaxed) != mask {
+                        tracing::debug!(left, right, "PC triggers read by the title");
+                    }
+                }
+            }
             true
         }
         _ => false,
@@ -1133,6 +1193,13 @@ mod host {
     }
 
     impl Source for Host {
+        fn pc_mode(&self) -> Option<pc::Mode> {
+            pc_mouse::enabled().then(|| {
+                pc_mouse::keep_clipped();
+                pc::Mode { focused: focused(), driving: pc_mouse::driving() }
+            })
+        }
+
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
@@ -1284,6 +1351,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        pc_mode: Option<pc::Mode>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1295,6 +1363,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn pc_mode(&self) -> Option<pc::Mode> {
+            self.0.lock().unwrap().pc_mode
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1521,6 +1592,61 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn pc_profile_uses_the_virtual_pad_and_clears_it_on_focus_loss() {
+        let (hub, host) = fake();
+        {
+            let mut host = host.lock().unwrap();
+            host.pc_mode = Some(pc::Mode { focused: true, driving: false });
+            host.keys = vec![key(b'W'), key(b'F')];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).buttons, Y);
+        assert_eq!(pad(r).left_y, 1.0);
+        release(r);
+
+        host.lock().unwrap().pc_mode = Some(pc::Mode { focused: false, driving: false });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+
+        {
+            let mut host = host.lock().unwrap();
+            host.pc_mode = Some(pc::Mode { focused: true, driving: true });
+            host.pads[0] = Some(PadState { buttons: X, ..Default::default() });
+        }
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, X);
+        release(r);
+    }
+
+    #[test]
+    fn pc_throttle_is_visible_to_the_next_reading_api() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pc_mode = Some(pc::Mode { focused: true, driving: true });
+        hub.poll();
+        let neutral = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(neutral), PadState::default());
+
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        let pressed = walk(hub, 0x28, neutral).unwrap();
+        assert_eq!(pad(pressed).right_trigger, 1.0);
+        assert_eq!(pad(pressed).left_y, 0.0);
+
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let released = walk(hub, 0x28, pressed).unwrap();
+        assert_eq!(pad(released).right_trigger, 0.0);
+        for reading in [neutral, pressed, released] {
+            release(reading);
+        }
     }
 
     #[test]
