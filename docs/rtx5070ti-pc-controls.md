@@ -30,6 +30,6 @@ The game displays controller prompts. Set `VICTORY_PC_CONTROLS=1` before launch 
 
 The fullscreen window test matched the monitor dimensions and restored the window frame. All 15 GameInput tests passed. The Series X run confirmed fullscreen and driving mode at startup, captured the mouse on click, and received relative mouse movement. The title read the throttle as held from 21:37:44.647 to 21:37:53.356 UTC. The driving profile maps W to this trigger. The logs establish delivery of the input. Visible boat movement from that input remains unverified.
 
-The run wrote a new versioned checkpoint and ended after about nine minutes with `0xc0000005`. It read address zero at `VCRUNTIME140.dll+0x1c45a`, with the same first two title return offsets as earlier boat crashes. The checkpoint has not been replayed. [Earlier four-format water report](https://github.com/SkillIssueXO/victory-5070ti/commit/01e119a219e2356295c7269d87d4a3485d75f03d)
+The run wrote a new version of its `Player` save record. Its mission save container was unchanged, so checkpoint advancement remains unverified. The run ended after about nine minutes with `0xc0000005`. It read address zero at `VCRUNTIME140.dll+0x1c45a`, with the same first two title return offsets as earlier boat crashes. [Earlier four-format water report](https://github.com/SkillIssueXO/victory-5070ti/commit/01e119a219e2356295c7269d87d4a3485d75f03d)
 
 AI-assisted testing. The report contains source identifiers and aggregate measurements only.
