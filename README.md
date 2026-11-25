@@ -363,6 +363,31 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Set `VICTORY_PC_CONTROLS=1` before launch to opt into a keyboard and mouse
+layout for the stand-in pad. Click inside the game to capture the mouse.
+Press F8 to toggle capture. Switching away from the game releases it.
+The profile starts on foot. Set `VICTORY_PC_DRIVING=1` to start a vehicle
+checkpoint with W/S mapped to throttle and brake. Press F7 after entering
+or exiting a vehicle to switch profiles. The title displays controller prompts.
+
+F11 toggles borderless fullscreen. Set `VICTORY_FULLSCREEN=1` to start
+fullscreen on the monitor that holds the game window.
+
+| Keys | Pad input |
+|------|-----------|
+| W A S D on foot | Left stick |
+| W / S, A / D in a vehicle | RT / LT, left stick steering |
+| Mouse movement, I J K L | Right stick |
+| Right / left mouse button on foot | LT / RT |
+| F | Y |
+| Space on foot / in a vehicle | A / RB |
+| Left or right Shift, R | X, B |
+| Left or right Ctrl, V | Left / right stick click |
+| E, arrow keys | D-pad right, D-pad |
+| Tab, Q | LB, RB |
+| M, Esc | View, Menu |
+| Enter, Backspace | A, B |
+
 ## Commands
 
 ```
@@ -395,6 +420,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_FPS_COUNTER=0` | hides the yellow FPS counter in the top left of the game window |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
