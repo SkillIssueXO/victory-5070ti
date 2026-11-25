@@ -1,4 +1,9 @@
-# VIctory fork (work in progress)
+# VIctory on RTX 5070 Ti
+
+This fork records our NVIDIA tests and compatibility changes on top of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork). See the
+[testing notes](docs/rtx-5070-ti-tests.md) for measurements and how to collect
+comparable frame and memory reports.
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
