@@ -777,7 +777,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2088,8 +2091,21 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let limit = crate::indirect::DISPATCH_PART_LIMIT;
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe {
+            if x > limit && x <= 2 * limit && y == 1 && z == 1
+                && let Some((param, dword)) = split_group_base(p)
+            {
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                list.list.Dispatch(limit, 1, 1);
+                list.list.SetComputeRoot32BitConstant(param, limit, dword);
+                list.list.Dispatch(x - limit, 1, 1);
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            } else {
+                list.list.Dispatch(x, y, z);
+            }
+        };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2976,6 +2992,13 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        let parts = if kind == DISPATCH && max == 1 && count.is_none() {
+            split_group_base(p).and_then(|base| {
+                host_signature(DISPATCH, crate::indirect::DISPATCH_RECORD_BYTES).map(|signature| (base, signature))
+            })
+        } else {
+            None
+        };
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -3043,7 +3066,9 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if parts.is_some() {
+                    crate::indirect::bound_split(list, (&args.buffer, offset))
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -3087,14 +3112,24 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(((param, dword), split_signature)) = parts {
+                for part in 0..2 {
+                    let base = part * crate::indirect::DISPATCH_PART_LIMIT;
+                    let offset = u64::from(part * crate::indirect::DISPATCH_RECORD_BYTES);
+                    list.list.SetComputeRoot32BitConstant(param, base, dword);
+                    list.list.ExecuteIndirect(&split_signature, 1, &bounded, offset, None::<&ID3D12Resource>, 0);
+                }
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -3109,6 +3144,19 @@ impl State {
         }
         true
     }
+}
+
+/// The group-base word of an eligible compute pipeline.
+fn split_group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_SPLIT_DISPATCH").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let root = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let word = stage.translated().host.user_data.iter().find(|word| word.root == root)?;
+    Some((param, word.index))
 }
 
 /// The host command signature for one argument of `kind` with records

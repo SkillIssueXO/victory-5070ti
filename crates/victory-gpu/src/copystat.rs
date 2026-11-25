@@ -133,6 +133,10 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Texture refreshes flushed alone, and groups and textures sent to the worker pool.
+    TexSingle,
+    TexBatches,
+    TexBatchItems,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1125,6 +1129,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    let single = c[C::TexSingle as usize];
+    let groups = c[C::TexBatches as usize];
+    let items = c[C::TexBatchItems as usize];
+    if single + items > 0.0 {
+        tracing::info!(
+            "queued texture refreshes per frame: {single:.1} done alone, \
+             {items:.1} sent to workers in {groups:.1} groups"
+        );
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \

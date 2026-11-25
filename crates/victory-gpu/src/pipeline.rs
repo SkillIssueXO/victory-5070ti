@@ -141,7 +141,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, &self.hash);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -179,7 +179,7 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -189,6 +189,32 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
+    static GROUP_PROBE: OnceLock<Option<String>> = OnceLock::new();
+    if let Some(selected) = GROUP_PROBE.get_or_init(|| std::env::var("VICTORY_GROUP_BASE_DIAG").ok())
+        && selected.split(',').any(|prefix| !prefix.is_empty() && hash.starts_with(prefix))
+        && let Some(native) = programs.iter().find(|p| p.stage == HwStage::Cs)
+        && let Ok(program) = victory_shader::spill::build(native)
+        && let Ok(io) = victory_shader::io::raise(&program, native)
+    {
+        use victory_shader::io::Input;
+        let reads = [0, 1, 2].map(|axis| io.inputs.iter().any(|(_, input)| *input == Input::GroupId(axis)));
+        let words = native.layout.iter()
+            .map(|entry| u32::from(entry.user_data) + entry.sgprs)
+            .max()
+            .unwrap_or(0);
+        let spilled = victory_shader::spill::is_spilled(native);
+        let group_x = match &native.io {
+            victory_shader::native::StageIo::Cs(cs) => cs.system_sgprs().0[0],
+            _ => None,
+        };
+        let layout_overlap = group_x.is_some_and(|reg| native.layout.iter().any(|entry| {
+            let first = u32::from(native.stage.user_sgpr(entry.user_data));
+            u32::from(reg).checked_sub(first).is_some_and(|word| word < entry.sgprs)
+        }));
+        let offset = victory_shader::RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+        let base = host.user_data.iter().any(|word| word.root == offset);
+        tracing::info!(hash, ?reads, words, spilled, ?group_x, layout_overlap, base, "compute group offset eligibility");
+    }
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

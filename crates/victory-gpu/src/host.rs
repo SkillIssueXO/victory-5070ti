@@ -6760,13 +6760,17 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                    let writes_title = matches!(step, Step::Run(_));
+                    if writes_title {
                         batch.title_written();
+                    } else {
+                        // Host steps can consume the staging buffer's refreshed mip mask.
+                        batch.refresh_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
+                    if writes_title {
                         crate::watch::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]
@@ -6795,7 +6799,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            batch.textures_due.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6870,6 +6878,10 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: textures due, refreshed together at the next
+    /// flush (before a host step, a title write, or GPU execution), several
+    /// at a time.
+    textures_due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -7032,7 +7044,66 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.refresh_textures();
     }
+
+    /// The textures queued by [`wide_textures`], several at a time. Each
+    /// refresh reads its texture's title memory and writes its own staging
+    /// buffer and notes (under its own lock); a texture is queued once per
+    /// batch ([`Batch::texture_due`]). The time counted is the time it
+    /// took, not the threads' sum.
+    fn refresh_textures(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add};
+        match self.textures_due.len() {
+            0 => {}
+            1 => {
+                if let Some(staging) = self.textures_due.pop() {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::TexSingle, 1);
+                    staging.refresh();
+                }
+            }
+            _ => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::TexBatches, 1);
+                    add(C::TexBatchItems, self.textures_due.len() as u64);
+                }
+                let started = std::time::Instant::now();
+                let before = PREPARING[2].load(Ordering::Relaxed);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                    .textures_due
+                    .drain(..)
+                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[2].fetch_sub(
+                    summed.saturating_sub(started.elapsed().as_micros() as u64),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
+/// Whether a submission's texture checks run several at a time
+/// (`VICTORY_WIDE_TEXTURES=1`; off by default).
+///
+/// While the world streams in, a submission checks hundreds of textures,
+/// one after another on the submitting thread: each is read, hashed whole
+/// and, when it changed, detiled into its staging buffer. On an RTX 3090 Ti
+/// machine that was the frame line's "textures", 100-1,400 ms and 250-930
+/// MB a frame for the first two minutes of the world (the opening
+/// cutscene at 0.3-2 fps, some of its frames white), against about 5 ms
+/// later. The textures have nothing to do with one another, so with the
+/// switch the checks due in a batch are queued and run before host steps,
+/// title writes and GPU execution, on the threads kept for the snapshots
+/// (`crate::shadow::wide`).
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
