@@ -62,6 +62,27 @@ and comparing records. CGBJ already compares raw descriptor bytes in
 batches. The next comparison isolates descriptor worker scheduling
 while preserving the existing record comparison.
 
+## Descriptor worker comparison
+
+Setting `VICTORY_VIEW_THREADS=4` lowered the descriptor-record pool
+from six workers to four and kept the texture-view pool at four.
+Both runs used the same profiler, checkpoint, cache seed, and 4K
+Series X settings.
+
+| Descriptor workers | Held FPS | Throttle FPS | Throttle p95 |
+| --- | ---: | ---: | ---: |
+| 6 | 24.14 | 17.82 | 104.3 ms |
+| 4 | 24.14 | 20.88 | 80.3 ms |
+
+The four-worker replay recorded 338 successful presents over 16.141
+seconds under throttle. In the 15 complete periodic samples per run,
+median host descriptor creation fell from 6.20 to 5.34 ms, and the
+median submission wait was 6.12 ms with six workers and 6.26 ms with
+four. Both moving runs had a hitch above 480 ms. The four-worker
+capture still showed broad flat patches on the water. These are single
+replays with timeline tracing active. A repeat with tracing disabled
+is needed to establish the throughput effect.
+
 ## Reproduce the one-shader comparison
 
 1. Build the runtime revision and the repair revision in separate checkouts
