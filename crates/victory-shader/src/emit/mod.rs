@@ -429,6 +429,40 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    static WIDE_FOR_CONTAINER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select the wide lowering by the BLAKE3 hash prefix printed in runtime logs.
+pub fn wave_wide_only(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|prefix| prefix.trim().to_ascii_lowercase())
+            .filter(|prefix| !prefix.is_empty())
+            .collect()
+    });
+    only.iter().any(|prefix| hash.starts_with(prefix.as_str()))
+}
+
+/// Apply a container's selection during one translation on the current thread.
+pub fn with_wave_wide<T>(selected: bool, translate: impl FnOnce() -> T) -> T {
+    struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.1);
+        }
+    }
+
+    WIDE_FOR_CONTAINER.with(|wide| {
+        let _restore = Restore(wide, wide.replace(selected));
+        translate()
+    })
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -539,7 +573,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE")
+            .or_else(|| WIDE_FOR_CONTAINER.get().then(|| "1".into()));
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
