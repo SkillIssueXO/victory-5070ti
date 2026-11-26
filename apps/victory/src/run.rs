@@ -55,8 +55,32 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
-    let cfg = victory_core::Config::load()?;
-    victory_hle::modules::controls::configure(cfg.controls.as_ref()).map_err(anyhow::Error::msg)?;
+    let mut cfg = victory_core::Config::load()?;
+    let controls = cfg.controls.take().map(|settings| {
+        let bindings =
+            |table: std::collections::BTreeMap<_, victory_core::config::ControlBinding>| {
+                table
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into_outputs()))
+                    .collect()
+            };
+        victory_hle::modules::controls::Options {
+            enabled: settings.enabled,
+            mouse_sensitivity: settings.mouse_sensitivity,
+            mouse_y_scale: settings.mouse_y_scale,
+            mouse_invert_y: settings.mouse_invert_y,
+            mouse_capture: settings.mouse_capture,
+            mouse_carry: settings.mouse_carry,
+            stick_deadzone: settings.stick_deadzone,
+            stick_curve: settings.stick_curve,
+            walk_speed: settings.walk_speed,
+            keys_by_position: settings.keys_by_position,
+            start_in_vehicle: settings.start_in_vehicle,
+            on_foot: bindings(settings.on_foot),
+            vehicle: bindings(settings.vehicle),
+        }
+    });
+    victory_hle::modules::controls::configure(controls.as_ref()).map_err(anyhow::Error::msg)?;
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
