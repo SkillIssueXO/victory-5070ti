@@ -147,6 +147,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// A separate scripted controller used to reach the native keyboard test.
+    fn diagnostic_pad(&mut self) -> Option<PadState> {
+        None
+    }
     /// Mouse buttons held down (`controls::MOUSE_BUTTONS`); none while the
     /// cursor is not captured.
     fn mouse_buttons(&mut self) -> Vec<u8> {
@@ -202,6 +206,22 @@ fn merged(a: PadState, b: PadState) -> PadState {
 /// own slot and a remapper's) from being two players.
 fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
+}
+
+fn log_input_kind(kind: u32, method: &'static str) {
+    if super::controls::keys_as_pad() {
+        return;
+    }
+    static SEEN: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
+    let mut seen = lock(&SEEN);
+    if !seen.contains(&(kind, method)) {
+        seen.push((kind, method));
+        tracing::info!(
+            kind = format_args!("{kind:#x}"),
+            method,
+            "native input request"
+        );
+    }
 }
 
 #[repr(C)]
@@ -403,6 +423,7 @@ struct State {
     running: Vec<(u64, ThreadId)>,
     /// The keyboard and mouse as a pad; `None`: the old stand-in pad.
     controls: Option<Controls>,
+    keys_as_pad: bool,
     /// The last poll's host pads and keys, for pad reads in between.
     host_pads: [Option<PadState>; PADS],
 }
@@ -445,7 +466,8 @@ impl Hub {
         counts: Arc<Counts>,
         settings: super::controls::Settings,
     ) -> &'static Hub {
-        cursor::ENABLED.store(settings.enabled && settings.capture, Ordering::Relaxed);
+        let mapped = settings.enabled && settings.keys_as_pad;
+        cursor::ENABLED.store(mapped && settings.capture, Ordering::Relaxed);
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -460,7 +482,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
-                controls: settings.enabled.then(|| Controls::new(settings)),
+                keys_as_pad: settings.keys_as_pad,
+                controls: mapped.then(|| Controls::new(settings)),
                 host_pads: [None; PADS],
             }),
             returned: Condvar::new(),
@@ -500,7 +523,10 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys, mouse, buttons) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            if let Some(scripted) = source.diagnostic_pad() {
+                pads[0] = Some(pads[0].map_or(scripted, |host| merged(host, scripted)));
+            }
             (pads, source.keys(), source.mouse(), source.mouse_buttons())
         };
         let events = {
@@ -590,16 +616,23 @@ impl State {
             controls.feed(&held, counts);
             self.host_pads = pads;
             self.publish(devices, one_pad, now, None, &mut events);
-        } else if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
-            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
         } else {
-            let any_pad = pads.iter().any(Option::is_some);
-            for (slot, pad) in pads.into_iter().enumerate() {
-                self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+            let stand_in = if self.keys_as_pad {
+                fallback(&keys)
+            } else {
+                PadState::default()
+            };
+            if one_pad {
+                let pad = pads.into_iter().flatten().fold(stand_in, merged);
+                self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            } else {
+                let any_pad = pads.iter().any(Option::is_some);
+                for (slot, pad) in pads.into_iter().enumerate() {
+                    self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+                }
+                let stand_in = (!any_pad).then_some(Value::Pad(stand_in));
+                self.update(devices, FALLBACK, stand_in, now, &mut events);
             }
-            let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-            self.update(devices, FALLBACK, fallback, now, &mut events);
         }
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -665,6 +698,10 @@ impl State {
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
             slot.sequence += 1;
+            if !self.keys_as_pad && let Value::Keys(keys) = &value {
+                let keys = keys.iter().map(|key| key.virtual_key).collect::<Vec<_>>();
+                tracing::info!(sequence = slot.sequence, ?keys, "native keyboard available");
+            }
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
             }
@@ -871,6 +908,7 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    log_input_kind(kind, "current reading");
     let hub = hub(this);
     let mut state = hub.state();
     if kind & GAMEPAD_KIND != 0 {
@@ -958,6 +996,7 @@ extern "system" fn next_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    log_input_kind(kind, "next reading");
     relative(this, reference, kind, device, out, true)
 }
 extern "system" fn previous_reading(
@@ -967,6 +1006,7 @@ extern "system" fn previous_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    log_input_kind(kind, "previous reading");
     relative(this, reference, kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
@@ -1000,12 +1040,13 @@ fn token(out: *mut u64) -> HRESULT {
 extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
-    _kind: u32,
+    kind: u32,
     _threshold: f32,
     _context: *mut c_void,
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    log_input_kind(kind, "reading callback");
     tracing::warn!("input reading callbacks are never called");
     token(out)
 }
@@ -1296,13 +1337,28 @@ extern "system" fn key_count(this: *const Reading) -> u32 {
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
-    let Value::Keys(keys) = &reading(this).value else {
+    let reading = reading(this);
+    let Value::Keys(keys) = &reading.value else {
         return 0;
     };
     if out.is_null() {
         return 0;
     }
     let n = keys.len().min(count as usize);
+    if !super::controls::keys_as_pad() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        if LAST.swap(reading.sequence, Ordering::Relaxed) != reading.sequence {
+            let keys = keys[..n]
+                .iter()
+                .map(|key| key.virtual_key)
+                .collect::<Vec<_>>();
+            tracing::info!(
+                sequence = reading.sequence,
+                ?keys,
+                "title read native keyboard"
+            );
+        }
+    }
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
@@ -1330,23 +1386,33 @@ extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bo
 /// What the title reads, when it differs from what it read before:
 /// `VICTORY_LOG=victory_hle::modules::gameinput=debug`.
 fn log_title_read(reading: &Reading, state: &PadState) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
+    let native = !super::controls::keys_as_pad();
+    if !native && !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
     static LAST: Mutex<Option<PadState>> = Mutex::new(None);
     let mut last = lock(&LAST);
     if *last != Some(*state) {
         *last = Some(*state);
-        tracing::debug!(
-            device = reading.hub_index(),
-            sequence = reading.sequence,
-            buttons = format_args!("{:#06x}", state.buttons),
-            lt = state.left_trigger,
-            rt = state.right_trigger,
-            left = format_args!("{:+.3} {:+.3}", state.left_x, state.left_y),
-            right = format_args!("{:+.3} {:+.3}", state.right_x, state.right_y),
-            "title read pad"
-        );
+        macro_rules! log {
+            ($level:ident) => {
+                tracing::$level!(
+                    device = reading.hub_index(),
+                    sequence = reading.sequence,
+                    buttons = format_args!("{:#06x}", state.buttons),
+                    lt = state.left_trigger,
+                    rt = state.right_trigger,
+                    left = format_args!("{:+.3} {:+.3}", state.left_x, state.left_y),
+                    right = format_args!("{:+.3} {:+.3}", state.right_x, state.right_y),
+                    "title read pad"
+                )
+            };
+        }
+        if native {
+            log!(info);
+        } else {
+            log!(debug);
+        }
     }
 }
 
@@ -1698,7 +1764,7 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            if slot == 0 {
+            if slot == 0 && super::super::controls::keys_as_pad() {
                 for vk in scripted() {
                     if let Some(&(_, button)) =
                         super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
@@ -1708,6 +1774,22 @@ mod host {
                 }
             }
             Some(pad)
+        }
+
+        #[cfg(feature = "diagnostics")]
+        fn diagnostic_pad(&mut self) -> Option<PadState> {
+            static SCRIPT: LazyLock<(Instant, KeyScript)> = LazyLock::new(|| {
+                let text = std::env::var("VICTORY_PAD_KEYS").unwrap_or_default();
+                (Instant::now(), parse_keys(&text))
+            });
+            let (start, keys) = &*SCRIPT;
+            let pressed: Vec<_> = keys_at(keys, start.elapsed())
+                .map(|virtual_key| KeyState {
+                    virtual_key,
+                    ..Default::default()
+                })
+                .collect();
+            (!pressed.is_empty()).then(|| super::fallback(&pressed))
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -2447,6 +2529,45 @@ mod tests {
         assert_eq!(pad(reading).left_y, 1.0);
         release(reading);
         assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
+    }
+
+    #[test]
+    fn native_keyboard_reading_never_drives_the_controller() {
+        let settings = super::super::controls::Settings {
+            keys_as_pad: false,
+            start_in_vehicle: true,
+            ..Default::default()
+        };
+        let (hub, host) = fake_with_topology(true, settings);
+        {
+            let mut source = host.lock().unwrap();
+            source.keys = vec![key(b'W'), key(0x0d)];
+            source.buttons = vec![0x01];
+        }
+        hub.counts.add(500, 500);
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut keys = [KeyState::default(); 2];
+        assert_eq!(key_state(r, 2, keys.as_mut_ptr()), 2);
+        assert_eq!(keys.map(|key| key.virtual_key), [b'W', 0x0d]);
+        release(r);
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: B,
+                ..Default::default()
+            }
+        );
+        release(r);
     }
 
     #[test]

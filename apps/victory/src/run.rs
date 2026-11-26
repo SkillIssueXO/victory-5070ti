@@ -76,8 +76,13 @@ pub fn run(
             walk_speed: settings.walk_speed,
             keys_by_position: settings.keys_by_position,
             start_in_vehicle: settings.start_in_vehicle,
+            aircraft_vehicle: matches!(
+                settings.vehicle_layout,
+                Some(victory_core::config::VehicleLayout::Aircraft)
+            ),
             on_foot: bindings(settings.on_foot),
             vehicle: bindings(settings.vehicle),
+            aircraft: bindings(settings.aircraft),
         }
     });
     victory_hle::modules::controls::configure(controls.as_ref()).map_err(anyhow::Error::msg)?;

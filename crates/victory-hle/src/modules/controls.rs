@@ -309,12 +309,14 @@ const ON_FOOT: &[(&str, &[&str])] = &[
     ("P", &["Menu"]),
 ];
 
-/// In a vehicle: W/S throttle and brake on the triggers, A/D steer.
+/// Land and water vehicles, including bicycles.
 const VEHICLE: &[(&str, &[&str])] = &[
     ("W", &["RT"]),
     ("S", &["LT"]),
     ("A", &["LeftLeft"]),
     ("D", &["LeftRight"]),
+    ("Num8", &["LeftUp"]),
+    ("Num5", &["LeftDown"]),
     ("LShift", &["A"]),
     ("Space", &["RB"]),
     ("E", &["LS"]),
@@ -340,10 +342,31 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("P", &["Menu"]),
 ];
 
+/// Aircraft outputs follow the donor's GTA V-derived layout.
+const AIRCRAFT: &[(&str, &[&str])] = &[
+    ("W", &["RT"]),
+    ("S", &["LT"]),
+    ("A", &["LB"]),
+    ("D", &["RB"]),
+    ("Num8", &["LeftUp"]),
+    ("Num5", &["LeftDown"]),
+    ("Num4", &["LeftLeft"]),
+    ("Num6", &["LeftRight"]),
+    ("LShift", &[]),
+    ("Space", &[]),
+    ("E", &[]),
+    ("G", &["LS"]),
+    ("Tab", &[]),
+    ("MouseLeft", &["A"]),
+    ("MouseRight", &[]),
+];
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Settings {
     /// Off: the old stand-in pad (README's table) and nothing else.
     pub enabled: bool,
+    /// Keep the keyboard separate from the stand-in pad for a native input probe.
+    pub keys_as_pad: bool,
     pub sensitivity: f32,
     /// Vertical sensitivity relative to horizontal.
     pub y_scale: f32,
@@ -369,6 +392,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             enabled: true,
+            keys_as_pad: true,
             sensitivity: 1.0,
             y_scale: 1.0,
             invert_y: false,
@@ -399,8 +423,10 @@ pub struct Options {
     pub walk_speed: Option<f32>,
     pub keys_by_position: Option<bool>,
     pub start_in_vehicle: Option<bool>,
+    pub aircraft_vehicle: bool,
     pub on_foot: BTreeMap<String, Vec<String>>,
     pub vehicle: BTreeMap<String, Vec<String>>,
+    pub aircraft: BTreeMap<String, Vec<String>>,
 }
 
 impl Settings {
@@ -445,9 +471,27 @@ impl Settings {
         s.carry = file.mouse_carry.unwrap_or(s.carry);
         s.by_position = file.keys_by_position.unwrap_or(s.by_position);
         s.start_in_vehicle = file.start_in_vehicle.unwrap_or_default();
-        for (layout, binds, name) in [
-            (&mut s.on_foot, &file.on_foot, "on_foot"),
-            (&mut s.vehicle, &file.vehicle, "vehicle"),
+        let vehicle = if file.aircraft_vehicle {
+            for &(key, outputs) in AIRCRAFT {
+                s.vehicle
+                    .bind(key, outputs)
+                    .expect("valid aircraft defaults");
+            }
+            (&file.aircraft, "aircraft")
+        } else {
+            (&file.vehicle, "vehicle")
+        };
+        // Validate either override table even when the other profile is active.
+        let mut unused_vehicle = Layout::default();
+        let unused = if file.aircraft_vehicle {
+            (&file.vehicle, "vehicle")
+        } else {
+            (&file.aircraft, "aircraft")
+        };
+        for (layout, (binds, name)) in [
+            (&mut s.on_foot, (&file.on_foot, "on_foot")),
+            (&mut s.vehicle, vehicle),
+            (&mut unused_vehicle, unused),
         ] {
             for (key, binding) in binds {
                 let outs: Vec<&str> = binding.iter().map(String::as_str).collect();
@@ -472,12 +516,14 @@ fn fallback_settings() -> Settings {
 /// Takes `[controls]` from the config file (absent: CGBJ input). Call it
 /// before the title starts; later calls change nothing.
 pub fn configure(options: Option<&Options>) -> Result<(), String> {
-    let s = match options {
+    let mut s = match options {
         Some(options) => Settings::with_options(options)?,
         None => fallback_settings(),
     };
+    s.keys_as_pad = std::env::var_os("VICTORY_KEYS_AS_PAD").is_none_or(|value| value != "0");
     tracing::info!(
         enabled = s.enabled,
+        keys_as_pad = s.keys_as_pad,
         sensitivity = s.sensitivity,
         invert_y = s.invert_y,
         capture = s.capture,
@@ -491,6 +537,10 @@ pub fn configure(options: Option<&Options>) -> Result<(), String> {
 
 pub(super) fn settings() -> Settings {
     SETTINGS.get_or_init(fallback_settings).clone()
+}
+
+pub(super) fn keys_as_pad() -> bool {
+    SETTINGS.get().is_none_or(|settings| settings.keys_as_pad)
 }
 
 /// Mouse motion and wheel steps since they were last drained, added from
@@ -988,6 +1038,30 @@ mod tests {
             (pad.right_trigger, pad.left_trigger, pad.left_y),
             (0.0, 1.0, 0.0)
         );
+        let pad = held(&mut controls, &["Num8"]);
+        assert_eq!(pad.left_y, 1.0);
+    }
+
+    #[test]
+    fn aircraft_profile_uses_flight_bindings_without_layout_hotkeys() {
+        let options = Options {
+            aircraft_vehicle: true,
+            ..Options::default()
+        };
+        let mut c = Controls::new(Settings::with_options(&options).unwrap());
+        let p = held(&mut c, &["F"]);
+        assert_eq!(p.buttons, Y);
+        assert!(c.in_vehicle());
+        c.take(1, None, &Counts::default());
+        let p = held(
+            &mut c,
+            &["W", "A", "G", "MouseLeft", "Num6", "Tab", "F9", "F10"],
+        );
+        assert_eq!(p.buttons, LEFT_SHOULDER | LEFT_STICK | A);
+        assert_eq!((p.right_trigger, p.left_x), (1.0, 1.0));
+        assert!(c.in_vehicle());
+        held(&mut c, &["F"]);
+        assert!(!c.in_vehicle());
     }
 
     #[test]
