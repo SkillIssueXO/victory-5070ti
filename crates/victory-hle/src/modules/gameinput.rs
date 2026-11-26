@@ -1542,7 +1542,7 @@ mod host {
         was_focused: bool,
         was_captured: bool,
         cursor_window: usize,
-        clipped: bool,
+        clip: Option<(i32, i32, i32, i32)>,
         /// Mouse buttons held when the cursor was captured (the click that
         /// captured it): no shots until let go.
         swallowed: Vec<u8>,
@@ -1559,7 +1559,7 @@ mod host {
                 was_focused: false,
                 was_captured: false,
                 cursor_window: 0,
-                clipped: false,
+                clip: None,
                 swallowed: Vec::new(),
                 #[cfg(feature = "diagnostics")]
                 kbm: kbm::Script::from_env(),
@@ -1573,7 +1573,6 @@ mod host {
 
             let focus = !hwnd.is_null();
             let previous_window = self.cursor_window;
-            let was_clipped = self.clipped;
             cursor::FOCUSED.store(focus, Ordering::Relaxed);
             if !focus {
                 cursor::release();
@@ -1587,19 +1586,22 @@ mod host {
                 // SAFETY: plain queries.
                 let has_caption = unsafe { wm::GetWindowLongW(hwnd, wm::GWL_STYLE) } as u32
                     & wm::WS_CAPTION != 0;
-                let caption_click = has_caption && MOUSE_BUTTONS
-                    .into_iter()
-                    .any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0);
+                let caption_click = has_caption
+                    && MOUSE_BUTTONS
+                        .into_iter()
+                        .any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0);
                 if cursor::captures_on_focus(false, true, caption_click) {
                     cursor::capture();
                 }
             }
             self.was_focused = focus;
-            if cursor::clips(focus) {
-                // SAFETY: plain queries on the foreground window, ours.
+            let next = if cursor::clips(focus) {
+                // SAFETY: the foreground window is ours and the output pointers are valid.
                 unsafe {
                     let mut client = RECT::default();
-                    GetClientRect(hwnd, &mut client);
+                    if GetClientRect(hwnd, &mut client) == 0 {
+                        return;
+                    }
                     let mut corners = [
                         POINT {
                             x: client.left,
@@ -1613,29 +1615,33 @@ mod host {
                     ClientToScreen(hwnd, &mut corners[0]);
                     ClientToScreen(hwnd, &mut corners[1]);
                     let [a, b] = corners;
-                    if let Some((left, top, right, bottom)) =
-                        cursor::clip_rect((a.x, a.y, b.x, b.y))
-                    {
-                        let rect = RECT {
+                    cursor::clip_rect((a.x, a.y, b.x, b.y))
+                }
+            } else {
+                None
+            };
+            let mut refresh_cursor = previous_window != self.cursor_window
+                || cursor::captured() != self.was_captured;
+            if self.clip != next {
+                // SAFETY: the rectangle is valid during the call. Null releases the clip.
+                let updated = unsafe {
+                    match next {
+                        Some((left, top, right, bottom)) => ClipCursor(&RECT {
                             left,
                             top,
                             right,
                             bottom,
-                        };
-                        self.clipped = ClipCursor(&rect) != 0;
-                    } else if self.clipped {
-                        ClipCursor(std::ptr::null());
-                        self.clipped = false;
+                        }),
+                        None => ClipCursor(std::ptr::null()),
                     }
+                };
+                if updated != 0 {
+                    self.clip = next;
+                    refresh_cursor = true;
+                    tracing::debug!(clip = ?self.clip, "game cursor clip applied");
                 }
-            } else if self.clipped {
-                // SAFETY: lets go of the clip we set.
-                unsafe { ClipCursor(std::ptr::null()) };
-                self.clipped = false;
             }
-            if focus && self.cursor_window != 0
-                && (was_clipped != self.clipped || previous_window != self.cursor_window)
-            {
+            if refresh_cursor && self.cursor_window != 0 {
                 super::super::lifecycle::sync_cursor(hwnd);
             }
         }
@@ -2140,7 +2146,11 @@ mod host {
         unsafe {
             let hwnd = GetForegroundWindow();
             GetWindowThreadProcessId(hwnd, &mut process);
-            if process == GetCurrentProcessId() { hwnd } else { std::ptr::null_mut() }
+            if process == GetCurrentProcessId() {
+                hwnd
+            } else {
+                std::ptr::null_mut()
+            }
         }
     }
 
