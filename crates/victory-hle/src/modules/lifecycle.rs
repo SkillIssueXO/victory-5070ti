@@ -95,6 +95,8 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+const SYNC_CURSOR: u32 = wm::WM_APP + 0x315;
+const CURSOR_TOKEN: usize = 0x564b_424d;
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -226,18 +228,36 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-/// Puts our procedure in front of the title's.
-fn hook(hwnd: HWND) {
+/// Installs the lifecycle and input procedure once on a window in our process.
+pub(crate) fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
     }
-    // SAFETY: a window this thread just created. The title's procedure is
-    // stored before ours can run.
+    static INSTALL: Mutex<()> = Mutex::new(());
+    let _install = INSTALL.lock().unwrap_or_else(|err| err.into_inner());
+    let procedure = window_proc as *const () as isize;
+    // SAFETY: the caller has checked ownership or just created the window.
+    // Its previous procedure is stored before ours can be called.
     unsafe {
-        let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
-        wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
-        wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        let previous = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
+        if previous == procedure || previous == 0 {
+            return;
+        }
+        if wm::SetPropW(hwnd, TITLE_PROC, previous as *mut c_void) == 0 {
+            tracing::warn!("could not store the game window procedure");
+            return;
+        }
+        if wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, procedure) == 0 {
+            wm::RemovePropW(hwnd, TITLE_PROC);
+            tracing::warn!("could not attach the game window input handler");
+        }
     }
+}
+
+/// Refreshes the visible cursor on the window's own UI thread.
+pub(crate) fn sync_cursor(hwnd: HWND) {
+    // SAFETY: the private message carries only an integer token.
+    unsafe { wm::PostMessageW(hwnd, SYNC_CURSOR, CURSOR_TOKEN, 0) };
 }
 
 extern "system" fn window_proc(
@@ -247,6 +267,22 @@ extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if victory_gpu::window_mode_message(hwnd as usize, message, wparam, lparam) {
+        return 0;
+    }
+    if message == SYNC_CURSOR && wparam == CURSOR_TOKEN {
+        // SAFETY: the foreground window owns the visible cursor shape.
+        unsafe {
+            if wm::GetForegroundWindow() == hwnd {
+                let captured = super::gameinput::cursor::captured();
+                let cursor = if captured {
+                    std::ptr::null_mut()
+                } else {
+                    wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW)
+                };
+                wm::SetCursor(cursor);
+                tracing::debug!(captured, "cursor applied on game window thread");
+            }
+        }
         return 0;
     }
     // A user close (close button, Alt+F4, window or taskbar menu); a
