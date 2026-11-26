@@ -96,6 +96,10 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+mod window_mode;
+#[cfg(windows)]
+pub use window_mode::window_mode_message;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
