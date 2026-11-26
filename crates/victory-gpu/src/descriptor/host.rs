@@ -119,9 +119,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
-    /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// Per-draw slots past `count`, sized by [`dynamic_slots`] for view
+    /// heaps. Sampler heaps have none.
     dynamic: u32,
     sampler: bool,
     /// Where the raw twins of the title's slots start
@@ -1482,24 +1481,38 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
-/// (0: none): up to four times as many where the host heap has the room (a
-/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
-fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+fn configured_dynamic_slots() -> Option<u32> {
+    static SLOTS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+    })
+}
+
+/// Dynamic slots for a heap with `count` title slots and a null descriptor at
+/// `null`. When the capped host cannot hold the whole title heap plus the
+/// dynamic reserve, use more of its slots for dynamic tables. The tested
+/// retail heap's upper range is a ring of per-draw tables that already get
+/// copied into dynamic slots. Keep 393,215 title slots by default for the
+/// long-lived views below that ring (fxceless/victory-fork#1258).
+///
+/// `VICTORY_DYNAMIC_SLOTS` can select the capped split, with at least
+/// [`DYNAMIC`] dynamic slots and 65,536 title slots. On an uncapped host it
+/// still limits the existing allocation of spare slots.
+fn dynamic_slots(count: u32, null: u32, configured: Option<u32>) -> u32 {
+    let spare = null.saturating_sub(count);
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        if spare >= DYNAMIC {
+            return DYNAMIC;
+        }
+        const TITLE_SLOTS: u32 = 393_215;
+        const MIN_TITLE_SLOTS: u32 = 1 << 16;
+        let default = null.saturating_sub(TITLE_SLOTS.min(count));
+        let maximum = null.saturating_sub(MIN_TITLE_SLOTS).max(DYNAMIC);
+        return configured.unwrap_or(default).clamp(DYNAMIC, maximum);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    spare.min(configured.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -1534,7 +1547,11 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let extra = if sampler {
+            0
+        } else {
+            dynamic_slots(count, null, configured_dynamic_slots())
+        };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1550,8 +1567,14 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                let title_slots = null - extra;
+                tracing::warn!(
+                    count,
+                    title_slots,
+                    dynamic_slots = extra,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
+                title_slots
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -5661,6 +5684,24 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn dynamic_slots_rebalance_only_an_overflowing_capped_heap() {
+        let capped_null = PORTABLE_VIEWS - 1;
+        let retail_count = 1_245_184;
+        assert_eq!(dynamic_slots(retail_count, capped_null, None), 606_784);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(DYNAMIC)), DYNAMIC);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(500_000)), 500_000);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(10)), DYNAMIC);
+        assert_eq!(
+            dynamic_slots(retail_count, capped_null, Some(u32::MAX)),
+            capped_null - (1 << 16),
+        );
+        assert_eq!(dynamic_slots(capped_null - DYNAMIC, capped_null, None), DYNAMIC);
+        let uncapped_null = 2_000_000 - 1;
+        assert_eq!(dynamic_slots(retail_count, uncapped_null, None), uncapped_null - retail_count);
+        assert_eq!(dynamic_slots(retail_count, uncapped_null, Some(500_000)), 500_000);
     }
 
     #[test]
