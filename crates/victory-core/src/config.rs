@@ -44,10 +44,20 @@ pub struct ControlsConfig {
     pub walk_speed: Option<f32>,
     pub keys_by_position: Option<bool>,
     pub start_in_vehicle: Option<bool>,
+    pub vehicle_layout: Option<VehicleLayout>,
     #[serde(default)]
     pub on_foot: BTreeMap<String, ControlBinding>,
     #[serde(default)]
     pub vehicle: BTreeMap<String, ControlBinding>,
+    #[serde(default)]
+    pub aircraft: BTreeMap<String, ControlBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VehicleLayout {
+    LandWater,
+    Aircraft,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -200,15 +210,23 @@ mod tests {
             [controls]
             keys_by_position = false
             start_in_vehicle = true
+            vehicle_layout = "aircraft"
             [controls.vehicle]
             W = "RT"
             Mouse4 = ["LB", "RB"]
+            [controls.aircraft]
+            G = "LS"
             "#,
         )
         .unwrap();
         let controls = parsed.controls.unwrap();
         assert_eq!(controls.keys_by_position, Some(false));
         assert_eq!(controls.start_in_vehicle, Some(true));
+        assert!(matches!(
+            controls.vehicle_layout,
+            Some(VehicleLayout::Aircraft)
+        ));
+        assert_eq!(controls.aircraft["G"].clone().into_outputs(), ["LS"]);
         assert_eq!(controls.vehicle["W"].clone().into_outputs(), ["RT"]);
         assert_eq!(
             controls.vehicle["Mouse4"].clone().into_outputs(),

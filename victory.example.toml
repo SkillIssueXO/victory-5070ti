@@ -23,6 +23,7 @@ test_titles = []
 [controls]
 # enabled = true           # false: the old fixed stand-in pad only
 # start_in_vehicle = false # true: start with W/S on throttle/brake for a vehicle checkpoint
+# vehicle_layout = "land_water" # use "aircraft" for a flight session
 # mouse_sensitivity = 1.0  # 1.0: 2,000 mouse counts/s = a full right stick
 # mouse_y_scale = 1.0      # vertical sensitivity relative to horizontal
 # mouse_invert_y = false
@@ -44,3 +45,5 @@ test_titles = []
 # MouseLeft = "RT"
 # [controls.vehicle]
 # W = "RT"
+# [controls.aircraft]
+# G = "LS"
