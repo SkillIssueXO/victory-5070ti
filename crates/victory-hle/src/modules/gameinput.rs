@@ -1541,6 +1541,7 @@ mod host {
         counts: Arc<Counts>,
         was_focused: bool,
         was_captured: bool,
+        cursor_window: usize,
         clipped: bool,
         /// Mouse buttons held when the cursor was captured (the click that
         /// captured it): no shots until let go.
@@ -1557,6 +1558,7 @@ mod host {
                 mouse: MouseState::default(),
                 was_focused: false,
                 was_captured: false,
+                cursor_window: 0,
                 clipped: false,
                 swallowed: Vec::new(),
                 #[cfg(feature = "diagnostics")]
@@ -1566,16 +1568,29 @@ mod host {
 
         /// Captures the cursor when the title window gets focus, frees it
         /// when it loses it, and holds a captured one inside the window.
-        fn cursor(&mut self, focus: bool) {
+        fn cursor(&mut self, hwnd: windows_sys::Win32::Foundation::HWND) {
+            use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+
+            let focus = !hwnd.is_null();
+            let previous_window = self.cursor_window;
+            let was_clipped = self.clipped;
             cursor::FOCUSED.store(focus, Ordering::Relaxed);
             if !focus {
                 cursor::release();
-            } else if !self.was_focused {
+                self.cursor_window = 0;
+            } else if cursor::ENABLED.load(Ordering::Relaxed) && previous_window != hwnd as usize {
+                // The graphics fallback window is created outside the title's window API.
+                super::super::lifecycle::hook(hwnd);
+                self.cursor_window = hwnd as usize;
+            }
+            if focus && (!self.was_focused || previous_window != self.cursor_window) {
                 // SAFETY: plain queries.
-                let button_down = MOUSE_BUTTONS
+                let has_caption = unsafe { wm::GetWindowLongW(hwnd, wm::GWL_STYLE) } as u32
+                    & wm::WS_CAPTION != 0;
+                let caption_click = has_caption && MOUSE_BUTTONS
                     .into_iter()
                     .any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0);
-                if cursor::captures_on_focus(self.was_focused, focus, button_down) {
+                if cursor::captures_on_focus(false, true, caption_click) {
                     cursor::capture();
                 }
             }
@@ -1583,7 +1598,6 @@ mod host {
             if cursor::clips(focus) {
                 // SAFETY: plain queries on the foreground window, ours.
                 unsafe {
-                    let hwnd = GetForegroundWindow();
                     let mut client = RECT::default();
                     GetClientRect(hwnd, &mut client);
                     let mut corners = [
@@ -1608,8 +1622,7 @@ mod host {
                             right,
                             bottom,
                         };
-                        ClipCursor(&rect);
-                        self.clipped = true;
+                        self.clipped = ClipCursor(&rect) != 0;
                     } else if self.clipped {
                         ClipCursor(std::ptr::null());
                         self.clipped = false;
@@ -1619,6 +1632,11 @@ mod host {
                 // SAFETY: lets go of the clip we set.
                 unsafe { ClipCursor(std::ptr::null()) };
                 self.clipped = false;
+            }
+            if focus && self.cursor_window != 0
+                && (was_clipped != self.clipped || previous_window != self.cursor_window)
+            {
+                super::super::lifecycle::sync_cursor(hwnd);
             }
         }
     }
@@ -1793,16 +1811,16 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            let hwnd = focused_window();
+            self.cursor(hwnd);
             // The F1 settings menu takes the keyboard while it is shown.
             if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
                 return Vec::new();
             }
-            let focus = focused();
-            self.cursor(focus);
             let mut down = scripted();
             #[cfg(feature = "diagnostics")]
             down.extend(self.kbm.keys(&self.counts));
-            if focus {
+            if !hwnd.is_null() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -2116,12 +2134,13 @@ mod host {
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    fn focused_window() -> windows_sys::Win32::Foundation::HWND {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            GetWindowThreadProcessId(hwnd, &mut process);
+            if process == GetCurrentProcessId() { hwnd } else { std::ptr::null_mut() }
         }
     }
 
