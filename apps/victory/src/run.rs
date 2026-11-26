@@ -56,6 +56,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    victory_hle::modules::controls::configure(cfg.controls.as_ref()).map_err(anyhow::Error::msg)?;
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
