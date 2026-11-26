@@ -14,8 +14,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
-use serde::Deserialize;
-
 use super::gameinput::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
     RIGHT_STICK, UP, VIEW, X, Y,
@@ -387,40 +385,26 @@ impl Default for Settings {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Binding {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct File {
-    enabled: Option<bool>,
-    mouse_sensitivity: Option<f32>,
-    mouse_y_scale: Option<f32>,
-    mouse_invert_y: Option<bool>,
-    mouse_capture: Option<bool>,
-    mouse_carry: Option<bool>,
-    stick_deadzone: Option<f32>,
-    stick_curve: Option<f32>,
-    walk_speed: Option<f32>,
-    keys_by_position: Option<bool>,
-    start_in_vehicle: Option<bool>,
-    #[serde(default)]
-    on_foot: BTreeMap<String, Binding>,
-    #[serde(default)]
-    vehicle: BTreeMap<String, Binding>,
+/// Typed options from the launcher, independent of the config file format.
+#[derive(Default)]
+pub struct Options {
+    pub enabled: Option<bool>,
+    pub mouse_sensitivity: Option<f32>,
+    pub mouse_y_scale: Option<f32>,
+    pub mouse_invert_y: Option<bool>,
+    pub mouse_capture: Option<bool>,
+    pub mouse_carry: Option<bool>,
+    pub stick_deadzone: Option<f32>,
+    pub stick_curve: Option<f32>,
+    pub walk_speed: Option<f32>,
+    pub keys_by_position: Option<bool>,
+    pub start_in_vehicle: Option<bool>,
+    pub on_foot: BTreeMap<String, Vec<String>>,
+    pub vehicle: BTreeMap<String, Vec<String>>,
 }
 
 impl Settings {
-    /// The defaults with `[controls]` applied; a layout table replaces only
-    /// the keys it names.
-    pub(super) fn parse(table: &toml::Table) -> Result<Settings, String> {
-        let file: File = toml::Value::Table(table.clone())
-            .try_into()
-            .map_err(|e| format!("[controls]: {e}"))?;
+    fn with_options(file: &Options) -> Result<Settings, String> {
         let mut s = Settings::default();
         let range = |name: &str, v: Option<f32>, lo: f32, hi: f32, into: &mut f32| match v {
             Some(v) if !(lo..=hi).contains(&v) => {
@@ -466,10 +450,7 @@ impl Settings {
             (&mut s.vehicle, &file.vehicle, "vehicle"),
         ] {
             for (key, binding) in binds {
-                let outs: Vec<&str> = match binding {
-                    Binding::One(o) => vec![o.as_str()],
-                    Binding::Many(os) => os.iter().map(String::as_str).collect(),
-                };
+                let outs: Vec<&str> = binding.iter().map(String::as_str).collect();
                 layout
                     .bind(key, &outs)
                     .map_err(|e| format!("[controls.{name}]: {e}"))?;
@@ -490,9 +471,9 @@ fn fallback_settings() -> Settings {
 
 /// Takes `[controls]` from the config file (absent: CGBJ input). Call it
 /// before the title starts; later calls change nothing.
-pub fn configure(table: Option<&toml::Table>) -> Result<(), String> {
-    let s = match table {
-        Some(t) => Settings::parse(t)?,
+pub fn configure(options: Option<&Options>) -> Result<(), String> {
+    let s = match options {
+        Some(options) => Settings::with_options(options)?,
         None => fallback_settings(),
     };
     tracing::info!(
@@ -949,9 +930,12 @@ mod tests {
         for scan in [0x01, 0x0F, 0x1C, 0x1D, 0x39, 0x2A, 0xE035, 0xE048] {
             assert_eq!(us_key(scan), None, "{scan:#x}");
         }
-        let off: toml::Table = toml::from_str("keys_by_position = false").unwrap();
+        let off = Options {
+            keys_by_position: Some(false),
+            ..Options::default()
+        };
         assert!(Settings::default().by_position);
-        assert!(!Settings::parse(&off).unwrap().by_position);
+        assert!(!Settings::with_options(&off).unwrap().by_position);
     }
 
     #[test]
@@ -984,8 +968,11 @@ mod tests {
 
     #[test]
     fn a_vehicle_checkpoint_starts_with_throttle_and_brake_keys() {
-        let table = toml::from_str("start_in_vehicle = true").unwrap();
-        let mut controls = Controls::new(Settings::parse(&table).unwrap());
+        let options = Options {
+            start_in_vehicle: Some(true),
+            ..Options::default()
+        };
+        let mut controls = Controls::new(Settings::with_options(&options).unwrap());
         let counts = Counts::default();
         controls.feed(&[b'W'], &counts);
         let pad = controls.peek(None);
@@ -994,7 +981,7 @@ mod tests {
             (1.0, 0.0, 0.0)
         );
 
-        let mut controls = Controls::new(Settings::parse(&table).unwrap());
+        let mut controls = Controls::new(Settings::with_options(&options).unwrap());
         controls.feed(&[b'S'], &counts);
         let pad = controls.peek(None);
         assert_eq!(
@@ -1188,25 +1175,22 @@ mod tests {
 
     #[test]
     fn config_rebinds_unbinds_and_refuses_typos() {
-        let table: toml::Table = toml::from_str(
-            r#"
-            mouse_sensitivity = 2.5
-            mouse_invert_y = true
-            stick_deadzone = 0.24
-            [on_foot]
-            Space = "A"
-            LShift = ""
-            Mouse4 = ["LB", "RB"]
-            [vehicle]
-            W = "RightTrigger_typo"
-            "#,
-        )
-        .unwrap();
-        let e = Settings::parse(&table).unwrap_err();
-        assert!(e.contains("RightTrigger_typo"), "{e}");
-        let mut table = table;
-        table.remove("vehicle");
-        let s = Settings::parse(&table).unwrap();
+        let mut options = Options {
+            mouse_sensitivity: Some(2.5),
+            mouse_invert_y: Some(true),
+            stick_deadzone: Some(0.24),
+            on_foot: BTreeMap::from([
+                ("Space".into(), vec!["A".into()]),
+                ("LShift".into(), vec!["".into()]),
+                ("Mouse4".into(), vec!["LB".into(), "RB".into()]),
+            ]),
+            vehicle: BTreeMap::from([("W".into(), vec!["RightTrigger_typo".into()])]),
+            ..Options::default()
+        };
+        let error = Settings::with_options(&options).unwrap_err();
+        assert!(error.contains("RightTrigger_typo"), "{error}");
+        options.vehicle.clear();
+        let s = Settings::with_options(&options).unwrap();
         assert_eq!((s.sensitivity, s.invert_y, s.deadzone), (2.5, true, 0.24));
         assert_eq!(s.on_foot.outputs(0x20), &[Output::Button(A)]);
         assert!(s.on_foot.outputs(0xA0).is_empty());
@@ -1222,14 +1206,21 @@ mod tests {
             Settings::default().on_foot.outputs(b'W')
         );
         for bad in [
-            "mouse_sensitivty = 1.0",
-            "stick_deadzone = 1.5",
-            "[on_foot]\nBanana = \"A\"",
+            Options {
+                stick_deadzone: Some(1.5),
+                ..Options::default()
+            },
+            Options {
+                on_foot: BTreeMap::from([("Banana".into(), vec!["A".into()])]),
+                ..Options::default()
+            },
         ] {
-            let t: toml::Table = toml::from_str(bad).unwrap();
-            assert!(Settings::parse(&t).is_err(), "{bad}");
+            assert!(Settings::with_options(&bad).is_err());
         }
-        let off: toml::Table = toml::from_str("enabled = false").unwrap();
-        assert!(!Settings::parse(&off).unwrap().enabled);
+        let off = Options {
+            enabled: Some(false),
+            ..Options::default()
+        };
+        assert!(!Settings::with_options(&off).unwrap().enabled);
     }
 }

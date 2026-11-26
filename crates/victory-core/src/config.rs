@@ -4,6 +4,7 @@
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -25,7 +26,44 @@ pub struct Config {
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
     /// `[controls]`: keyboard and mouse bindings, read by `victory-hle`.
-    pub controls: Option<toml::Table>,
+    pub controls: Option<ControlsConfig>,
+}
+
+/// User-provided input settings. The input module supplies the defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlsConfig {
+    pub enabled: Option<bool>,
+    pub mouse_sensitivity: Option<f32>,
+    pub mouse_y_scale: Option<f32>,
+    pub mouse_invert_y: Option<bool>,
+    pub mouse_capture: Option<bool>,
+    pub mouse_carry: Option<bool>,
+    pub stick_deadzone: Option<f32>,
+    pub stick_curve: Option<f32>,
+    pub walk_speed: Option<f32>,
+    pub keys_by_position: Option<bool>,
+    pub start_in_vehicle: Option<bool>,
+    #[serde(default)]
+    pub on_foot: BTreeMap<String, ControlBinding>,
+    #[serde(default)]
+    pub vehicle: BTreeMap<String, ControlBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ControlBinding {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ControlBinding {
+    pub fn into_outputs(self) -> Vec<String> {
+        match self {
+            Self::One(output) => vec![output],
+            Self::Many(outputs) => outputs,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,7 +71,7 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
-    controls: Option<toml::Table>,
+    controls: Option<ControlsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,6 +192,30 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn controls_parse_booleans_and_both_forms_of_rebinding() {
+        let parsed: FileConfig = toml::from_str(
+            r#"
+            [controls]
+            keys_by_position = false
+            start_in_vehicle = true
+            [controls.vehicle]
+            W = "RT"
+            Mouse4 = ["LB", "RB"]
+            "#,
+        )
+        .unwrap();
+        let controls = parsed.controls.unwrap();
+        assert_eq!(controls.keys_by_position, Some(false));
+        assert_eq!(controls.start_in_vehicle, Some(true));
+        assert_eq!(controls.vehicle["W"].clone().into_outputs(), ["RT"]);
+        assert_eq!(
+            controls.vehicle["Mouse4"].clone().into_outputs(),
+            ["LB", "RB"]
+        );
+        assert!(toml::from_str::<FileConfig>("[controls]\nmouse_sensitivty = 1.0").is_err());
+    }
 
     #[test]
     fn environment_overrides_file() {
