@@ -1,4 +1,37 @@
-# VIctory on an RX 7900 XTX
+# VIctory with ray tracing on RTX 5070 Ti
+
+With the existing ray-tracing mode enabled, all 53 acceleration-structure
+builder pipelines ran on a GeForce RTX 5070 Ti on Windows 11. This run used
+the Series S profile at 1920×1080 with a warmed local cache. A 30-second
+sample while moving in the boat averaged 13 FPS. The shoreline looked
+greener in the sampled views. The intermittent purple flicker at the
+original bridge angle still needs a matched comparison.
+
+Build and launch from PowerShell using your own game files.
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' `
+    -Console series-s -RayTracing -More @{
+        VICTORY_DISPLAY_MODE = '1920x1080'
+        VICTORY_FULLSCREEN = '1'
+        VICTORY_ASYNC_SUBMIT = '1'
+        VICTORY_AMBIENT_AIR = '1.5'
+        VICTORY_LEVELS_ON_DEMAND = '1'
+        VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        VICTORY_TEXTURE_BACK = '256x256f41,256x256f16,64x64f16,128x128f36'
+        VICTORY_LOG = 'info'
+    }
+```
+
+The log reports `the ray-tracing structure builder runs` and `pipelines=53`
+when the builder starts. The test used the local [water and sun checkpoint
+cache](docs/cgbj-water-only.md). Point `VICTORY_CACHE_DIR` at your own compatible
+cache to reuse it. The branch also includes the
+[PC keyboard and mouse mappings](docs/cgbj-pc-layouts.md) and the
+[NVIDIA descriptor-pool backport](https://github.com/fxceless/victory-fork/pull/1258).
+
+## Upstream CGBJ notes
 
 ## Run the codec_d Windows build
 
