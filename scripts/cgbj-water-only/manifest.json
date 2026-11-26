@@ -1,0 +1,31 @@
+{
+  "executable": {
+    "source": "9047aa8eb0a541d5bf3dd2a3985be1796f9fb682",
+    "sha256": "d3c6aa1984acda5d4e001a7c0a5902bd29dd44c86b0ed6ae49dec824a4a4ee27"
+  },
+  "baseCache": {
+    "files": 2326,
+    "sha256": "5039e525f781c4fdfae260240b6320d2d885b374ebbb2b05eaa3b477a080ced6"
+  },
+  "preparedCache": {
+    "files": 2328,
+    "sha256": "060344b968810c3f4aba7df165bb62090e685dcef2cd8b0e6ec65013250628be"
+  },
+  "shaders": [
+    {
+      "gameShader": "1aa247ed3653b616",
+      "cachePath": "shaders/19/f20b540df46ba5a38f3c867c03f0d724754531c1b1eb40d68fc1d5b27a1cbb",
+      "sha256": "1b413d95b0aff6279025879fb972d3f78f11a5e8088c16652672a6da1936b679"
+    },
+    {
+      "gameShader": "5dc3b25986622949",
+      "cachePath": "shaders/5f/15d573faecdb15ed4bc937fcdacf737ec785b147e4a112f291c18021b022cc",
+      "sha256": "092eb875dfdd58383df7374ca048065f221f643db26a04fef626b54b1a2d103b"
+    },
+    {
+      "gameShader": "6f225b641c5b0708",
+      "cachePath": "shaders/b0/3e28de2a0bf45c00f47d1776e65bb76ca7513a7597ce67ad0ccf20178a07a8",
+      "sha256": "de295912016b07b1289d7ecb8051de8f640bf07164d0327f8c70661c81664f82"
+    }
+  ]
+}
