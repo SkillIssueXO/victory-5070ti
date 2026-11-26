@@ -34,6 +34,33 @@ over 29.967 seconds at the helm and 301 over 16.125 seconds under throttle.
 Each result comes from one replay. Scene timing varies, and longer gameplay
 still needs testing.
 
+## Series X submission trace
+
+A diagnostic replay at 3840 × 2160 reused the repaired composite, the
+same saved checkpoint, and the same launcher settings. It recorded
+24.14 FPS over 29.986 seconds held and 17.82 FPS over 16.052 seconds
+under throttle, with 104.3 ms throttle p95. The longest throttle gap
+was 550.8 ms and began about 0.3 seconds after the first moving trace
+finished writing. The earlier replay is the throughput baseline for
+comparisons without the timeline enabled.
+
+The timeline recorded three bursts with zero dropped trace events.
+Each burst began with a present interval under 1.2 ms. The ranges below
+use the next two intervals from each burst. GPU time integrates the
+graphics submission timestamps within each present interval. CPU
+spans overlap GPU execution and one another.
+
+| Sample | Intervals | Present interval | Graphics submissions | Descriptor wait | Resource refresh worker window |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Held | 2 | 38.13–39.69 ms | 21.46–37.51 ms | 1.71–6.41 ms | 6.33–7.66 ms |
+| Throttle | 4 | 39.87–64.89 ms | 19.81–47.03 ms | 1.86–12.30 ms | 6.35–11.12 ms |
+
+The worker window includes work performed by the submitting thread.
+These bursts show both a descriptor wait worth isolating and
+substantial graphics work in the same replay. Upstream already has
+a per-page descriptor fingerprint implementation to evaluate in a
+controlled comparison. [Upstream descriptor change](https://github.com/fxceless/victory-fork/commit/9376fd6)
+
 ## Reproduce the one-shader comparison
 
 1. Build the runtime revision and the repair revision in separate checkouts
