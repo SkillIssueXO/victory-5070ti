@@ -18,6 +18,7 @@ The camera and individual waves varied between captures.
 | Run | Game output | Held FPS | Throttle FPS | Throttle p95 |
 | --- | ---: | ---: | ---: | ---: |
 | CGBJ Series X, stock composite | 3840 × 2160 | 26.05 | 19.29 | 105.2 ms |
+| CGBJ Series X, repaired composite | 3840 × 2160 | 23.99 | 18.60 | 118.1 ms |
 | CGBJ Series S, stock composite | 1920 × 1080 | 26.66 | 20.08 | 96.8 ms |
 | CGBJ Series S, repaired composite | 1920 × 1080 | 26.25 | 23.16 | 55.5 ms |
 
@@ -26,10 +27,12 @@ seconds of scripted right-trigger input from a copy of the same checkpoint.
 FPS is based on successful DXGI presents. A screenshot was taken during
 each throttle sample. Series X used THIN recording with the ambient
 overrides unset. Both Series S runs used THIN with CGBJ's ambient
-compensation. The samples establish the tested visual repair and short
-playthrough throughput. A repeat run is needed to separate the apparent
-throttle improvement from scene timing. The repaired Series X path and
-longer gameplay remain untested.
+compensation. The repaired Series X replay restored smooth sky gradients
+and a bright sun disk. Broad, flat patches remained in the water under
+throttle. The repaired Series X capture recorded 720 accepted presents
+over 29.967 seconds at the helm and 301 over 16.125 seconds under throttle.
+Each result comes from one replay. Scene timing varies, and longer gameplay
+still needs testing.
 
 ## Reproduce the one-shader comparison
 
