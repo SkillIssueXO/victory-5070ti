@@ -83,6 +83,23 @@ capture still showed broad flat patches on the water. These are single
 replays with timeline tracing active. A repeat with tracing disabled
 is needed to establish the throughput effect.
 
+## Water-volumetric replay
+
+The selective shader build loaded and created both water-volumetric
+compute pipelines in a 4K Series X replay. The four-worker control
+reported one dropped dispatch per frame for each of those programs.
+The selective replay finished the timed throttle window with zero
+reported drops for either program. It showed turquoise water with
+dark rectangles both at rest and under throttle. The repaired sun
+and sky were visible. [Selective source](https://github.com/SkillIssueXO/victory-5070ti/tree/cgbj-selective-wave-water)
+
+The replay averaged 24.54 FPS over 29.957 seconds held and 18.61 FPS
+over 16.173 seconds under throttle, with 113.5 ms p95 while moving.
+It used a fresh driver cache with tracing disabled. These figures
+describe the replay with the additional shaders active. The color
+and tile coverage still need visual verification with the separate
+tile-list repair. [Tile-list diagnosis](https://github.com/iGoldenNinja/victory-fork/commit/d380bef4e1f873c0c488af7dc38a6b6c5d6be021)
+
 ## Reproduce the one-shader comparison
 
 1. Build the runtime revision and the repair revision in separate checkouts
