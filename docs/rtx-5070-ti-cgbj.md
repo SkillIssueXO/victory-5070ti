@@ -56,10 +56,11 @@ spans overlap GPU execution and one another.
 | Throttle | 4 | 39.87–64.89 ms | 19.81–47.03 ms | 1.86–12.30 ms | 6.35–11.12 ms |
 
 The worker window includes work performed by the submitting thread.
-These bursts show both a descriptor wait worth isolating and
-substantial graphics work in the same replay. Upstream already has
-a per-page descriptor fingerprint implementation to evaluate in a
-controlled comparison. [Upstream descriptor change](https://github.com/fxceless/victory-fork/commit/9376fd6)
+Across 15 periodic samples during throttle, the descriptor worker
+reported a median 6.20 ms making host descriptors and 1.93 ms reading
+and comparing records. CGBJ already compares raw descriptor bytes in
+batches. The next comparison isolates descriptor worker scheduling
+while preserving the existing record comparison.
 
 ## Reproduce the one-shader comparison
 
