@@ -7964,6 +7964,7 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        let mut planning = crate::timeline::span("collecting front refresh steps");
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
@@ -7992,6 +7993,7 @@ impl Batch {
                 }
             }
         }
+        planning.next("merging and indexing front refresh spans");
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
@@ -8000,6 +8002,7 @@ impl Batch {
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        planning.end();
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
@@ -8010,6 +8013,7 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
+        let mut refreshing = crate::timeline::span("classifying small front refresh batches");
         const FEW: usize = 256;
         let mut spans = spans;
         let many = spans.len() > FEW;
@@ -8020,6 +8024,7 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
+        refreshing.next("asking for front refresh pages");
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
@@ -8027,23 +8032,31 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        refreshing.next("waiting for front refresh workers");
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
+                let _texture = crate::timeline::span("refreshing a front texture");
                 due[i].refresh();
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            let unchanged = many && {
+                let _check = crate::timeline::span("classifying a front buffer refresh");
+                shadow.nothing_new(*from, *to - *from)
+            };
+            if unchanged {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Self::update(shadow, *from, *to);
         });
+        refreshing.next("clearing front refresh page hints");
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        refreshing.end();
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
