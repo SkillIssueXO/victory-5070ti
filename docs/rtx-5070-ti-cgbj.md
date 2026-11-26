@@ -1,0 +1,109 @@
+# CGBJ on RTX 5070 Ti
+
+This branch preserves the CGBJ revision we tested on Windows with a Ryzen 7
+9850X3D, RTX 5070 Ti, and 32 GB of RAM. The runtime was built from
+`558e0aa4b93d355bcc1dc89ae9b22f3dc51f5282`. Its cache used a single
+`PS_CompositeNMB` pixel shader compiled from
+`70efdffa683ce8d8477dd24b15638e170320478f`. The original CGBJ source is
+[`f4b48ad`](https://github.com/Lq0ne/cool_fox/commit/f4b48ad766ddbec1a1867022cd42f7645b0dd55e).
+
+## Results
+
+The corrected Series S boat scene showed a bright sun, smooth sky gradients,
+and continuous bright reflections through a timed throttle run. In a
+260 × 294 pixel area of the reflection band in the held views, the count of
+pixels with all three channels at or below 32 fell from 1,260 to zero.
+The camera and individual waves varied between captures.
+
+| Run | Game output | Held FPS | Throttle FPS | Throttle p95 |
+| --- | ---: | ---: | ---: | ---: |
+| CGBJ Series X, stock composite | 3840 × 2160 | 26.05 | 19.29 | 105.2 ms |
+| CGBJ Series S, stock composite | 1920 × 1080 | 26.66 | 20.08 | 96.8 ms |
+| CGBJ Series S, repaired composite | 1920 × 1080 | 26.25 | 23.16 | 55.5 ms |
+
+Each held sample covered about 30 seconds. Each throttle sample used 16.2
+seconds of scripted right-trigger input from a copy of the same checkpoint.
+FPS is based on successful DXGI presents. A screenshot was taken during
+each throttle sample. Series X used THIN recording with the ambient
+overrides unset. Both Series S runs used THIN with CGBJ's ambient
+compensation. The samples establish the tested visual repair and short
+playthrough throughput. A repeat run is needed to separate the apparent
+throttle improvement from scene timing. The repaired Series X path and
+longer gameplay remain untested.
+
+## Reproduce the one-shader comparison
+
+1. Build the runtime revision and the repair revision in separate checkouts
+   using the pinned Rust toolchain and Microsoft C++ Build Tools.
+
+   ```powershell
+   cargo build --locked --profile diag -p victory --features diagnostics
+   ```
+
+2. Use the same local title installation for both. Set `$archive` to your
+   local shader archive. Set `$runtime` and `$compiler` to the two built
+   executables. Set `$scratch` to a new directory outside the repository.
+   The commands below generate the original and repaired cache entries in
+   separate trees, using the Wave32 cap and null-view slot observed on the
+   tested RTX 5070 Ti.
+
+   ```powershell
+   $wanted = Join-Path $scratch 'composite-only.txt'
+   New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+   '6318f669e4f17d65' | Set-Content -LiteralPath $wanted -Encoding ascii
+   $env:VICTORY_HOST_WAVE = '32'
+   $env:VICTORY_VIEW_LIMIT = '999999'
+   $env:VICTORY_LOG = 'info,victory_gpu::shader_cache=debug'
+   $env:VICTORY_CACHE_DIR = Join-Path $scratch 'stock'
+   & $runtime translate --warm $wanted --jobs 1 $archive
+   $env:VICTORY_CACHE_DIR = Join-Path $scratch 'repaired'
+   & $compiler translate --warm $wanted --jobs 1 $archive
+   ```
+
+3. Generate a stock game cache with the runtime and keep a separate copy for
+   the comparison. Check that the stock probe entry matches the existing
+   game-cache file at the path reported in the log, relative to its cache
+   root. Check that both entries have the same `VSH1` magic, pixel stage,
+   and binding metadata. The wrapper stores a little-endian DXIL length at
+   byte 8 and the metadata starts at byte 12 plus that length. Copy the
+   repaired entry over the **stock entry's relative path** in the private
+   cache copy. The repair compiler's cache key differs because its
+   translator source changed.
+
+4. Start the runtime with fresh copies of the checkpoint data, changing
+   `VICTORY_CACHE_DIR` between the stock cache and the repaired copy.
+   Start with the Series S options below. The cache hit and the first
+   shader bind are reported in the log. Keep each trace and cache outside
+   the repository.
+
+   ```powershell
+   $settings = @{
+       VICTORY_TEXTURE_NO_WAIT='1'; VICTORY_RELAY='2'; VICTORY_WIDE_BACK='1'
+       VICTORY_CARD_REHASH_RUNS='1'; VICTORY_JOIN_COPIES='1'
+       VICTORY_INDIRECT_WINDOW='1'; VICTORY_RELAY_COPY='1'; VICTORY_CARD_STEPS='2'
+       VICTORY_INDIRECT_BATCH='2'; VICTORY_MAP_THREADS='1'; VICTORY_CARD_AWAKE='1'
+       VICTORY_SHOW_AFTER='1'; VICTORY_JOIN_PARTS='8'; VICTORY_UPLOAD_AHEAD='1'
+       VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_CARD_BUFFERS_MIN_KB='64'
+       VICTORY_AMBIENT='0.8'; VICTORY_AMBIENT_AIR='1.5'; VICTORY_THIN='1'
+       VICTORY_LOG='info,victory_gpu::frame=debug,victory_gpu::shader_cache=debug'
+   }
+   foreach ($setting in $settings.GetEnumerator()) {
+       Set-Item -LiteralPath "Env:$($setting.Key)" -Value $setting.Value
+   }
+   $env:VICTORY_KEYS = (2..13 | ForEach-Object { '{0}:Enter' -f ($_ * 4) }) -join ','
+   & $runtime run $gameExecutable --execute --console series-s
+   ```
+
+   For a timed comparison, set `VICTORY_KEYS_FILE` to a fresh path before
+   starting. At the playable helm, write `32:C:16.2` to that file. After
+   the log reports `playthrough input batch loaded`, use seconds 1–31
+   for the held view and seconds 32–48.2 for throttle. Count consecutive
+   `swap chain accepted present` events in each window. Divide the number
+   of intervals by elapsed time between the first and last events.
+
+The regression fixture passed on the RTX 5070 Ti. The repaired pixel shader
+passed DXIL validation and linked with the original CGBJ vertex shader in
+the offline pipeline test. The arithmetic change comes from Moon0755's
+port of Calvix2k's VIctory work. [fxceless PR 1026](https://github.com/fxceless/victory-fork/pull/1026)
+
+See the [asset policy](asset-policy.md) before submitting results.

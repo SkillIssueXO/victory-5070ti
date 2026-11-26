@@ -1,6 +1,12 @@
-# VIctory on an RX 7900 XTX
+# VIctory on RTX 5070 Ti with CGBJ
 
-## Run the codec_d Windows build
+This RTX 5070 Ti checkpoint adds the timed boat replay and the source for the
+CGBJ sun and reflection repair. The tested Series S run averaged 26.25 FPS at
+the helm and 23.16 FPS under throttle. See the
+[RTX 5070 Ti checkpoint notes](docs/rtx-5070-ti-cgbj.md) for the exact
+reproduction and its limits.
+
+## Upstream CGBJ launcher
 
 Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
 
