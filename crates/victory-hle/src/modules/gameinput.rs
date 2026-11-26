@@ -1241,17 +1241,16 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
+    type KeyScript = Vec<(std::ops::Range<Duration>, u8)>;
+
+    fn parse_keys(text: &str) -> KeyScript {
+        text.lines()
+            .map(|line| line.split('#').next().unwrap_or_default())
+            .flat_map(|line| line.split(','))
+            .filter_map(|entry| {
+                let mut fields = entry.split(':');
+                let at = fields.next()?.trim();
+                let vk = match fields.next()?.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
                     "Tab" => 0x09,
@@ -1265,21 +1264,100 @@ mod host {
                     }
                     _ => return None,
                 };
+                let hold = fields.next();
+                if fields.next().is_some() {
+                    return None;
+                }
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
+                let (start, end) = if let Some((from, until)) = at.split_once('-') {
+                    if hold.is_some() {
+                        return None;
+                    }
+                    (time(from)?, time(until)?)
+                } else {
+                    let start = time(at)?;
+                    let hold = match hold {
+                        Some(seconds) => time(seconds)?,
+                        None => Duration::from_millis(200),
+                    };
+                    (start, start.checked_add(hold)?)
                 };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
+                (start < end).then_some((start..end, vk))
+            })
+            .collect()
+    }
+
+    fn keys_at(keys: &KeyScript, elapsed: Duration) -> impl Iterator<Item = u8> + '_ {
+        keys.iter()
+            .filter(move |(range, _)| range.contains(&elapsed))
+            .map(|(_, vk)| *vk)
+    }
+
+    struct LiveKeys {
+        path: std::path::PathBuf,
+        next_read: Instant,
+        started: Instant,
+        text: String,
+        keys: KeyScript,
+    }
+
+    impl LiveKeys {
+        fn poll(&mut self, now: Instant) {
+            if now < self.next_read {
+                return;
+            }
+            self.next_read = now + Duration::from_millis(100);
+            if let Ok(text) = std::fs::read_to_string(&self.path)
+                && text != self.text
+            {
+                self.keys = parse_keys(&text);
+                self.text = text;
+                self.started = now;
+                tracing::info!(keys = self.keys.len(), "playthrough input batch loaded");
+            }
+        }
+    }
+
+    /// `VICTORY_KEYS` accepts `delay:key[:hold]` and `from-to:key` from
+    /// startup. `VICTORY_KEYS_FILE` takes the same input when its text changes.
+    fn scripted() -> Vec<u8> {
+        static SCRIPT: LazyLock<(Instant, KeyScript)> = LazyLock::new(|| {
+            let text = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            (Instant::now(), parse_keys(&text))
+        });
+        static LIVE: LazyLock<Option<Mutex<LiveKeys>>> = LazyLock::new(|| {
+            let path = std::env::var_os("VICTORY_KEYS_FILE")?.into();
+            let now = Instant::now();
+            Some(Mutex::new(LiveKeys {
+                path,
+                next_read: now,
+                started: now,
+                text: String::new(),
+                keys: Vec::new(),
+            }))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+        let mut down: Vec<_> = keys_at(keys, start.elapsed()).collect();
+        if let Some(live) = &*LIVE {
+            let mut live = live.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            live.poll(now);
+            down.extend(keys_at(&live.keys, now.duration_since(live.started)));
+            down.sort_unstable();
+            down.dedup();
+        }
+        down
+    }
+
+    #[test]
+    fn timed_input_keeps_legacy_ranges_and_supports_explicit_holds() {
+        let script = parse_keys("# throttle test\n1:Enter,2-4:C,3:W:2,4-2:N,5:Z:bad");
+        let at = |ms| keys_at(&script, Duration::from_millis(ms)).collect::<Vec<_>>();
+        assert_eq!(at(1100), [0x0d]);
+        assert_eq!(at(1200), []);
+        assert_eq!(at(3500), [b'C', b'W']);
+        assert_eq!(at(4500), [b'W']);
+        assert_eq!(at(5000), []);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

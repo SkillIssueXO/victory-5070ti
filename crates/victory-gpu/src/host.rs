@@ -9256,7 +9256,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if _status == windows::Win32::Foundation::S_OK {
+                tracing::debug!(target: "victory_gpu::frame", token = frame, "swap chain accepted present");
+            } else {
+                tracing::debug!(target: "victory_gpu::frame", token = frame, status = format_args!("{:#010x}", _status.0), "swap chain present status");
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
