@@ -10025,8 +10025,12 @@ impl Host {
             );
             let called = crate::streamline::present_called(&presenting);
             let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            if result.0 == 0 {
-                tracing::debug!(
+            static PRESENT_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let timing = *PRESENT_TIMING.get_or_init(|| {
+                std::env::var_os("VICTORY_PRESENT_TIMING").is_some_and(|value| value == "1")
+            });
+            if timing && result.0 == 0 {
+                tracing::info!(
                     target: "victory_gpu::frame",
                     token = frame,
                     "swap chain accepted present"
