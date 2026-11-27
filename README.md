@@ -1,5 +1,7 @@
 # VIctory on NVIDIA
 
+See the [BEST ONE YET checkpoint](docs/best-one-yet.md) for the tested RTX 5070 Ti launch settings and local water cache details.
+
 ## Quick start: how to run it
 
 **The easy way: one file, nothing to build**
