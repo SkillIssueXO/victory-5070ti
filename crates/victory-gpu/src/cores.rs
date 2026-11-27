@@ -111,6 +111,58 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_SUBMIT_HELPER_PRIORITY=1`; `VICTORY_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+///
+/// On a processor with six cores (i5-12400F, 12 threads) the title's threads
+/// and eight translating lists kept every core busy, and the submitting
+/// thread (above normal since `queue::behind`) stood waiting for helpers at
+/// normal priority that were not running. Measured with `VICTORY_AB` in one
+/// run (run10, Series S at 540p, medians of 5-second windows in the world,
+/// off / on): 8.6 / 9.6 fps, refreshes 23.1 / 17.6 ms a frame, waiting for
+/// the heaps' records 6.2 / 2.5 ms, the card idle behind the submitting
+/// thread 24.7 / 13.2 ms. Lowering the translating threads below normal as
+/// well made each list call about 5 % slower, with no clear gain of its own.
+fn helpers_raised() -> bool {
+    crate::asked_for!("VICTORY_SUBMIT_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<i32>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let priority = if helpers_raised() {
+            THREAD_PRIORITY_ABOVE_NORMAL
+        } else {
+            helper_priority().unwrap_or(THREAD_PRIORITY_NORMAL)
+        };
+        if self.applied == Some(priority) {
+            return;
+        }
+        // SAFETY: our own thread.
+        let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
+        tracing::debug!(priority, set, "submission helper thread priority");
+        self.applied = Some(priority);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
