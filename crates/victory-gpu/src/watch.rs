@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -664,6 +665,66 @@ fn ask_run(
     ask_run(b, asked, written, false);
 }
 
+#[derive(Clone, Copy)]
+struct AllocationRegion {
+    end: usize,
+    private: bool,
+}
+
+#[derive(Default)]
+struct AllocationHints {
+    regions: BTreeMap<usize, (AllocationRegion, Instant)>,
+}
+
+impl AllocationHints {
+    fn get(&self, first: usize, now: Instant) -> Option<AllocationRegion> {
+        let (_, &(region, expires)) = self.regions.range(..=first).next_back()?;
+        (first < region.end && now < expires).then_some(region)
+    }
+
+    fn put(&mut self, first: usize, region: AllocationRegion, now: Instant) {
+        const LIMIT: usize = 1024;
+        const LIFETIME: Duration = Duration::from_secs(2);
+        if self.regions.len() == LIMIT && !self.regions.contains_key(&first) {
+            self.regions.pop_first();
+        }
+        self.regions.insert(first, (region, now + LIFETIME));
+    }
+}
+
+/// Only a grouping hint. A remap can leave an old hint here. Each proposed
+/// group still goes through GetWriteWatch and unanswered ranges still go
+/// through per-range tracking.
+fn allocation_region(first: usize) -> Option<AllocationRegion> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    thread_local! {
+        static HINTS: std::cell::RefCell<AllocationHints> = std::cell::RefCell::new(AllocationHints::default());
+    }
+    HINTS.with_borrow_mut(|hints| {
+        let now = Instant::now();
+        if let Some(region) = hints.get(first, now) {
+            return Some(region);
+        }
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: `first` is a query address, and `info` is a valid output buffer.
+        let found = unsafe { VirtualQuery((first * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        #[cfg(feature = "diagnostics")]
+        tally(14, now.elapsed().as_nanos() as u64);
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE;
+        if found == 0 || end <= first {
+            return None;
+        }
+        let region = AllocationRegion {
+            end,
+            private: info.State == MEM_COMMIT && info.Type == MEM_PRIVATE,
+        };
+        hints.put(first, region, now);
+        Some(region)
+    })
+}
+
 /// Split a refused batch into ranges within individual Windows memory regions.
 /// This is planning information only. Only a successful write-watch query
 /// publishes coverage. A range that straddles a region or lies in a mapping
@@ -674,30 +735,18 @@ fn ask_within_allocations(
     asked: &mut Vec<(usize, usize)>,
     written: &mut Vec<(usize, u16)>,
 ) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
     let mut split = false;
     while let Some(&(first, first_end)) = pieces.first() {
         if pieces.len() < 2 {
             break;
         }
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        #[cfg(feature = "diagnostics")]
-        let begun = std::time::Instant::now();
-        // SAFETY: `first` is a query address, and `info` is a valid output buffer.
-        let found = unsafe { VirtualQuery((first * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        #[cfg(feature = "diagnostics")]
-        tally(14, begun.elapsed().as_nanos() as u64);
-        if found == 0 {
+        let Some(AllocationRegion { end: region_end, private }) = allocation_region(first) else {
             if !split {
                 return false;
             }
             ask_run(pieces, asked, written, false);
             break;
-        }
-        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE;
-        let private = info.State == MEM_COMMIT && info.Type == MEM_PRIVATE;
+        };
         if !split && private && last <= region_end {
             // The original query has already covered this homogeneous region.
             // Preserve the usual fallback for unwatchable private memory.
@@ -3345,6 +3394,18 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn allocation_hints_only_cover_contained_pages_until_expiry() {
+        use super::{AllocationHints, AllocationRegion, Duration, Instant};
+        let now = Instant::now();
+        let mut hints = AllocationHints::default();
+        hints.put(16, AllocationRegion { end: 24, private: true }, now);
+        assert!(hints.get(15, now).is_none());
+        assert_eq!(hints.get(23, now).map(|region| region.end), Some(24));
+        assert!(hints.get(24, now).is_none());
+        assert!(hints.get(16, now + Duration::from_secs(3)).is_none());
+    }
 
     #[test]
     fn refused_batch_preserves_writes_across_allocations() {
