@@ -317,6 +317,29 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    if victory_hle::modules::controls::mapped_input_enabled() {
+        let build = victory_game::identify(hash.as_str());
+        if std::env::var_os("VICTORY_AUTO_VEHICLE").is_some_and(|value| value == "1") {
+            if let Some(build) = build.filter(|build| build.vehicle_flag < image.info().size_of_image) {
+                victory_hle::modules::controls::set_vehicle_flag(image.base() + build.vehicle_flag as usize);
+                println!("controls       automatic vehicle layout enabled");
+            } else {
+                eprintln!("automatic vehicle layout is unavailable for this title build");
+            }
+        }
+        if std::env::var_os("VICTORY_PROMPTS").is_some_and(|value| value == "keys") {
+            if let Some(build) = build {
+                victory_game::prompts::pad::set_key_source(victory_hle::modules::controls::prompt_key);
+                // SAFETY: known build and mapped image, before any title threads run.
+                match unsafe { victory_game::prompts::hook::install(&image, build.key_prompts) } {
+                    Ok(()) => println!("controls       keyboard prompt hook installed"),
+                    Err(error) => eprintln!("keyboard prompts could not be installed: {error}"),
+                }
+            } else {
+                eprintln!("keyboard prompts are unavailable for this title build");
+            }
+        }
+    }
     if std::env::var_os("VICTORY_STORY_CLOCK").is_some_and(|value| value == "1") {
         // SAFETY: the verified image is still idle and stays loaded through title execution.
         unsafe { victory_loader::story_clock::install(&image, hash.as_str())? };

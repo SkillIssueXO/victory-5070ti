@@ -543,10 +543,64 @@ pub(super) fn keys_as_pad() -> bool {
     SETTINGS.get().is_none_or(|settings| settings.keys_as_pad)
 }
 
-pub(super) fn mapped_input_enabled() -> bool {
+pub fn mapped_input_enabled() -> bool {
     SETTINGS
         .get()
         .is_some_and(|settings| settings.enabled && settings.keys_as_pad)
+}
+
+/// Use a keyboard label only if the key emits this output in both configured
+/// layouts. The icon movie is shared and can outlive a vehicle transition.
+pub fn prompt_key(name: &'static str) -> Option<u8> {
+    let s = SETTINGS.get()?;
+    if !s.enabled || !s.keys_as_pad {
+        return None;
+    }
+    shared_prompt_key(s, output(name)?)
+}
+
+fn shared_prompt_key(s: &Settings, target: Output) -> Option<u8> {
+    s.on_foot.0.iter().find_map(|(&key, outputs)| {
+        (!matches!(key, WHEEL_UP | WHEEL_DOWN)
+            && outputs.contains(&target)
+            && s.vehicle.outputs(key).contains(&target))
+        .then_some(key)
+    })
+}
+
+#[cfg(windows)]
+static VEHICLE_FLAG: OnceLock<usize> = OnceLock::new();
+
+/// Registers the address from the verified title build before it starts.
+#[cfg(windows)]
+pub fn set_vehicle_flag(address: usize) {
+    let _ = VEHICLE_FLAG.set(address);
+}
+
+#[cfg(windows)]
+fn title_vehicle() -> Option<bool> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let &address = VEHICLE_FLAG.get()?;
+    let mut value = 0u8;
+    // The title owns and updates this byte. Read it through Windows so
+    // polling on the host input thread does not borrow title memory.
+    let read = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            (&raw mut value).cast(),
+            1,
+            std::ptr::null_mut(),
+        )
+    };
+    (read != 0 && value <= 1).then_some(value != 0)
+}
+
+#[cfg(not(windows))]
+fn title_vehicle() -> Option<bool> {
+    None
 }
 
 /// Mouse motion and wheel steps since they were last drained, added from
@@ -670,6 +724,7 @@ impl Look {
 pub(super) struct Controls {
     pub(super) s: Settings,
     vehicle: bool,
+    last_title_vehicle: Option<bool>,
     held: Vec<u8>,
     derived: Derived,
     /// Buttons and triggers pressed since the title's last read: they stay
@@ -690,6 +745,7 @@ impl Controls {
     pub(super) fn new(s: Settings) -> Controls {
         Controls {
             vehicle: s.start_in_vehicle,
+            last_title_vehicle: None,
             s,
             held: Vec::new(),
             derived: Derived::default(),
@@ -760,6 +816,17 @@ impl Controls {
     /// A host poll: the keys and mouse buttons held now, wheel steps since
     /// the last poll.
     pub(super) fn feed(&mut self, held: &[u8], counts: &Counts) {
+        self.feed_with_vehicle(held, counts, title_vehicle());
+    }
+
+    fn feed_with_vehicle(&mut self, held: &[u8], counts: &Counts, detected: Option<bool>) {
+        if let Some(vehicle) = detected && self.last_title_vehicle != Some(vehicle) {
+            self.last_title_vehicle = Some(vehicle);
+            self.vehicle = vehicle;
+            self.latched = 0;
+            self.latched_triggers = (false, false);
+            tracing::info!(vehicle, "controls followed the title's vehicle state");
+        }
         let steps = counts.drain_wheel();
         let key = if steps > 0 { WHEEL_UP } else { WHEEL_DOWN };
         for _ in 0..steps.unsigned_abs() {
@@ -774,7 +841,11 @@ impl Controls {
             .collect();
         for &vk in &pressed {
             let outs = self.layout().outputs(vk).to_vec();
-            if outs.contains(&Output::ToggleVehicle) {
+            // With the title state available, wait for a successful enter
+            // or exit. A standalone manual override still takes effect.
+            if outs.contains(&Output::ToggleVehicle)
+                && (self.last_title_vehicle.is_none() || !outs.contains(&Output::Button(Y)))
+            {
                 self.vehicle = !self.vehicle;
                 tracing::info!(vehicle = self.vehicle, key = %key_name(vk), "controls layout");
             }
@@ -1090,6 +1161,41 @@ mod tests {
         held(&mut c, &[]);
         held(&mut c, &["G"]);
         assert!(c.in_vehicle());
+    }
+
+    #[test]
+    fn vehicle_controls_follow_successful_title_transitions() {
+        let mut c = controls();
+        let counts = Counts::default();
+        c.feed_with_vehicle(&[vk("F")], &counts, Some(false));
+        assert_ne!(c.peek(None).buttons & Y, 0);
+        assert!(!c.in_vehicle());
+        c.feed_with_vehicle(&[vk("W")], &counts, Some(true));
+        assert!(c.in_vehicle());
+        assert_eq!(c.peek(None).right_trigger, 1.0);
+        c.feed_with_vehicle(&[vk("W")], &counts, Some(false));
+        assert_eq!(c.peek(None).right_trigger, 0.0);
+        assert_eq!(c.peek(None).left_y, 1.0);
+    }
+
+    #[test]
+    fn manual_override_survives_until_the_title_state_changes() {
+        let mut c = controls();
+        let counts = Counts::default();
+        c.feed_with_vehicle(&[vk("G")], &counts, Some(true));
+        assert!(!c.in_vehicle());
+        c.feed_with_vehicle(&[], &counts, Some(true));
+        assert!(!c.in_vehicle());
+        c.feed_with_vehicle(&[], &counts, Some(false));
+        c.feed_with_vehicle(&[], &counts, Some(true));
+        assert!(c.in_vehicle());
+    }
+
+    #[test]
+    fn prompt_keys_stay_correct_in_both_layouts() {
+        let settings = Settings::default();
+        assert_eq!(shared_prompt_key(&settings, Output::Button(Y)), Some(b'F'));
+        assert_eq!(shared_prompt_key(&settings, Output::Button(RIGHT_SHOULDER)), None);
     }
 
     #[test]

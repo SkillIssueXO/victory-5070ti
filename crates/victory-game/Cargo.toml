@@ -9,7 +9,14 @@ publish.workspace = true
 
 [dependencies]
 memchr.workspace = true
+victory-formats.workspace = true
 zlib-rs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+victory-loader.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [lints]
 workspace = true
