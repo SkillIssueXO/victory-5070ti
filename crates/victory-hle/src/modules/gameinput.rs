@@ -1904,33 +1904,45 @@ mod host {
         })
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. Keys as [`key_code`] names them (the
-    /// stand-in pad's table maps them to buttons). Also the keys of
-    /// [`live`] (`VICTORY_KEYS_FILE`).
+    type KeyScript = Vec<(Duration, Duration, u8)>;
+
+    fn parse_keys(list: &str) -> KeyScript {
+        let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+        list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let (key, hold) = match key.split_once(':') {
+                Some((key, hold)) => (key, time(hold)?),
+                None => (key, Duration::from_millis(200)),
+            };
+            let vk = key_code(key)?;
+            let (from, to) = match at.split_once('-') {
+                Some((from, to)) => (time(from)?, time(to)?),
+                None => {
+                    let from = time(at)?;
+                    (from, from.checked_add(hold)?)
+                }
+            };
+            Some((from, to, vk))
+        }).collect()
+    }
+
+    fn keys_at(keys: &KeyScript, now: Duration) -> impl Iterator<Item = u8> + '_ {
+        keys
+            .iter()
+            .filter(move |&&(from, to, _)| (from..to).contains(&now))
+            .map(|&(_, _, vk)| vk)
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` holds each key
+    /// for 0.2 s by default. `<from>-<to>:<key>` holds it for that range.
+    /// Also reads keys from [`live`] (`VICTORY_KEYS_FILE`).
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, KeyScript)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = key_code(key)?;
-                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
-                };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_keys(&list))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        let mut down: Vec<u8> = keys
-            .iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect();
+        let mut down: Vec<u8> = keys_at(keys, start.elapsed()).collect();
         for vk in live() {
             if !down.contains(&vk) {
                 down.push(vk);
