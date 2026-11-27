@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "lds_init.rs"]
+pub(super) mod lds_init;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -2606,6 +2609,7 @@ impl<'a> Lower<'a> {
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
         }
+        self.initialize_reduction_lds();
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -4666,6 +4670,37 @@ impl<'a> Lower<'a> {
                 (self.s.m.load(c, p0), self.s.m.load(c, p1))
             })
             .collect()
+    }
+
+    /// Initialize shared reduction identities while every host lane is still active.
+    fn initialize_reduction_lds(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.halves.is_none() || cs.threads.iter().product::<u32>() != 64
+            || std::env::var_os("VICTORY_LDS_INIT_HOIST").is_some_and(|v| v == "0")
+        {
+            return;
+        }
+        let inits = lds_init::lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let first = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[]);
+        let zero = self.s.m.i32(0);
+        let leader = self.s.m.cmp(e, pred::EQ, first, zero);
+        let (init, ready) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(e, Term::CondBr(leader, init, ready));
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, value) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(init, lds, at);
+            self.s.m.store(init, ptr, value);
+        }
+        self.s.m.terminate(init, Term::Br(ready));
+        self.group_sync(ready);
+        self.s.entry = ready;
     }
 
     /// A group barrier with an LDS fence in `block`.

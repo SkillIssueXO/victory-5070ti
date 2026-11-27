@@ -14,6 +14,29 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// The water kernels initialize the two LDS accumulators from one console
+/// thread. An early per-lane return can leave that thread inactive.
+#[test]
+fn tiled_water_min_max_identities_are_initialized_before_lane_exits() {
+    let mut kernel = native(&[
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02C1, // v_mov_b32 v4, -1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xD838_0100, 0x0004_0305, // ds_write2_b32 v5, v3, v4 offset1:1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xD81C_0004, 0x0000_0005, // ds_min_u32 v5, v0 offset:4
+        0xD820_0000, 0x0000_0005, // ds_max_u32 v5, v0
+    ]);
+    let StageIo::Cs(cs) = &mut kernel.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15;
+    let dwords = cs.lds_bytes() / 4;
+    let ir = crate::spill::build(&kernel).unwrap();
+    assert_eq!(lower::lds_init::lds_init_hoists(&ir, dwords), [(0, 0), (1, u32::MAX)]);
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.

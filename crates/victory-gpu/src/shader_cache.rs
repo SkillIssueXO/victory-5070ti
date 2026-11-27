@@ -77,6 +77,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
+            "VICTORY_LDS_INIT_HOIST",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
