@@ -1326,6 +1326,19 @@ pub(crate) fn log(frames: f64) {
         }
         kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
         let all: u64 = kinds.iter().map(|k| k.2).sum();
+        // Include every sampled interval, even for pipelines outside the
+        // heaviest forty listed below. These are diagnostic queue timestamps
+        // and can include work between markers.
+        let milliseconds = |kind| {
+            let us = kinds.iter().find(|(word, _, _)| word == kind).map_or(0, |(_, _, us)| *us);
+            us as f64 / 1e3 / frames
+        };
+        tracing::info!(
+            bvh_build_ms = milliseconds("bvh-build"),
+            ray_traversal_ms = milliseconds("ray-traversal"),
+            sampled_ms = all as f64 / 1e3 / frames,
+            "GPU command intervals per frame (timing run)"
+        );
         let text: Vec<String> =
             kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
         tracing::info!(

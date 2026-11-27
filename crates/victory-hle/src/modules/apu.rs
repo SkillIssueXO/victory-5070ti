@@ -299,9 +299,17 @@ pub extern "system" fn XApuEnqueueCommand(
         PROCESS => {
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
+            #[cfg(feature = "diagnostics")]
+            let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
             match decoder {
                 Some(d) => process(d, connection.options, &command, &mut result),
                 None => result.error = INVALID_STREAM,
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(started) = started {
+                // ApuResult is packed. Copy its fields before tracing them.
+                let (frames, status) = (result.frames, result.error);
+                tracing::debug!(stream, frames, status, us = started.elapsed().as_micros(), "Opus packet processed");
             }
         }
         _ => return INVALID_COMMAND,

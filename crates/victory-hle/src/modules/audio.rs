@@ -335,6 +335,8 @@ struct Voice {
 /// What a voice did, for the debug log when it is disabled.
 struct Trace {
     since: Instant,
+    /// Time from enabling the voice to publishing its first output block.
+    first_output_us: Option<u128>,
     /// Samples per channel written to the ring.
     produced: usize,
     /// Blocks the title took (command 18), how often, and how often it
@@ -429,6 +431,7 @@ impl Xma {
             ended: false,
             trace: Trace {
                 since: Instant::now(),
+                first_output_us: None,
                 produced: 0,
                 taken: 0,
                 takes: 0,
@@ -454,6 +457,7 @@ impl Xma {
         tracing::debug!(
             index,
             ms = t.since.elapsed().as_millis(),
+            first_output_us = ?t.first_output_us,
             produced = t.produced,
             taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
             takes = t.takes,
@@ -544,6 +548,9 @@ fn pump(context: Context, voice: &mut Voice) {
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
+        if voice.trace.first_output_us.is_none() {
+            voice.trace.first_output_us = Some(voice.trace.since.elapsed().as_micros());
+        }
         // The read block is the title's: taken modulo the ring like the
         // write block and `advance_read`'s. Compared as it is, one at or
         // past the end would never be met, and a stream that loops would
@@ -1312,6 +1319,7 @@ mod tests {
             ended: false,
             trace: Trace {
                 since: Instant::now(),
+                first_output_us: None,
                 produced: 0,
                 taken: 0,
                 takes: 0,

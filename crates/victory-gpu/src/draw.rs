@@ -4031,7 +4031,14 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return kind;
         };
-        let mut text = format!("{kind} {}", p.name);
+        let category = if crate::host::timing() && crate::pipeline::is_builder(self.pipeline as This) {
+            "bvh-build "
+        } else if p.stages.iter().any(|stage| stage.translated().traces_rays) {
+            "ray-traversal "
+        } else {
+            ""
+        };
+        let mut text = format!("{category}{kind} {}", p.name);
         // What it draws into (a dispatch writes through its views below).
         if !compute {
             let described = |t: usize| {

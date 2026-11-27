@@ -136,6 +136,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Uses the console's ray/box or ray/triangle intersection instructions.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) traces_rays: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -213,6 +216,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    #[cfg(feature = "diagnostics")]
+    let traces_rays = crate::host::timing() && programs.iter().any(|program| {
+        victory_shader::gfx10::decode(&program.code).is_ok_and(|code| {
+            code.iter().any(|instruction| matches!(instruction.name(), Some("image_bvh_intersect_ray" | "image_bvh64_intersect_ray")))
+        })
+    });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -231,6 +240,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        #[cfg(feature = "diagnostics")]
+        traces_rays,
         picks: Default::default(),
     })
 }

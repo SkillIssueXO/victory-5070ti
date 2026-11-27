@@ -1854,7 +1854,7 @@ fn card_budget() -> bool {
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
 #[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
