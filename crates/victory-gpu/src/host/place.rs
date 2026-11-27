@@ -62,6 +62,10 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+    pub(super) fn gpu_sourced(&self) -> bool {
+        self.from.is_none()
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
         let source = touches(written, self.src, self.src + self.len);
@@ -112,11 +116,13 @@ pub(super) enum Waits {
 /// The first step that reads a recorded copy's destination on the CPU.
 pub(super) fn cpu_reader(
     runs: &[&HostList],
-    _written: &[(usize, usize)],
+    written: &[(usize, usize)],
     mut ranges: Vec<(usize, usize)>,
     taken: impl Fn(&HostList, usize) -> bool,
 ) -> Option<&'static str> {
     join_ranges(&mut ranges, []);
+    let ordered = crate::toggled!("VICTORY_ORDER_PLACED_READS");
+    let mut earlier = Vec::new();
     #[cfg(feature = "diagnostics")]
     let mut upload = None;
     let found = runs.iter().enumerate().find_map(|(_list_at, list)| {
@@ -126,7 +132,7 @@ pub(super) fn cpu_reader(
             }
             match step {
                 &Step::Copy(_, src, len) => touches(&ranges, src, src + len).then_some("a CPU buffer copy reads a recorded copy's destination"),
-                Step::Fill(_, src, len, _target) if touches(&ranges, *src, *src + *len) => {
+                Step::Fill(_, src, len, _target) if touches(if ordered { &earlier } else { &ranges }, *src, *src + *len) => {
                     #[cfg(feature = "diagnostics")]
                     if crate::asked_for!("VICTORY_PLACED_UPLOAD_TRACE") {
                         let target = match _target {
@@ -145,15 +151,20 @@ pub(super) fn cpu_reader(
                 &Step::Plane((at, len), _) =>
                     touches(&ranges, at, at.saturating_add(len)).then_some("a movie plane reads a recorded copy's destination"),
                 Step::Host(_, (from, to)) => touches(&ranges, *from, *to).then_some("a CPU callback reads a recorded copy's destination"),
-                Step::Placed(p) => (p.from.is_some() && touches(&ranges, p.src, p.src + p.len))
-                    .then_some("a recorded copy stages the destination of another copy on the CPU"),
+                Step::Placed(p) => {
+                    if ordered && matches!(p.waits(written), Waits::ForReaders) {
+                        join_ranges(&mut earlier, [(p.dst, p.dst + p.len)]);
+                    }
+                    (p.from.is_some() && touches(&ranges, p.src, p.src + p.len))
+                        .then_some("a recorded copy stages the destination of another copy on the CPU")
+                }
                 _ => None,
             }
         })
     });
     #[cfg(feature = "diagnostics")]
     if let Some((at, src, len, target)) = upload {
-        trace_upload(runs, _written, at, src, len, target);
+        trace_upload(runs, written, at, src, len, target);
     }
     found
 }

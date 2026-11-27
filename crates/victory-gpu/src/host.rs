@@ -5737,16 +5737,10 @@ impl Host {
                 }
             }
         };
-        // That list runs first, and is one of the submission's from here on.
-        let with: Vec<&HostList>;
-        let runs = match &own {
-            Some(own) => {
-                with = std::iter::once(own.list()).chain(runs.iter().copied()).collect();
-                &with[..]
-            }
-            None => runs,
-        };
-        let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        // The GPU upload lists are part of this submission, in dependency
+        // order, under the same submission lock and completion fence.
+        let ordered = own.as_ref().map(|own| own.ordered_lists(runs, parts));
+        let (runs, parts) = ordered.as_ref().map_or((runs, parts), |(lists, boundaries)| (lists.as_slice(), boundaries.as_slice()));
         // The plan for two queues: the textures' states before the preludes
         // move them.
         let probe = two_queues::on().then(|| two_queues::probe(runs));
@@ -5831,7 +5825,7 @@ impl Host {
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
         if refresh_front() {
-            batch.refresh_front(runs, &parts);
+            batch.refresh_front(runs, parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
