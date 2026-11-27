@@ -2362,8 +2362,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    /// The last title-memory write, if it was a recorded GPU copy.
-    last_placed: Option<usize>,
+    /// Recorded buffer copies since the last deferred CPU write.
+    placed_copies: Vec<usize>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -2426,7 +2426,12 @@ impl Deferred {
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
-        self.last_placed = None;
+        self.placed_copies.clear();
+        self.invalidate_copies();
+    }
+
+    /// A write invalidates cached refreshes, declarations, and upload fills.
+    fn invalidate_copies(&mut self) {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();

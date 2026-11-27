@@ -331,6 +331,7 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        let at = deferred.copies.len();
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,
@@ -338,16 +339,16 @@ impl HostList {
             shadow: to,
             from: scratch.map(|s| s.2 as usize),
         }));
-        deferred.title_written();
-        deferred.last_placed = Some(deferred.copies.len() - 1);
+        deferred.invalidate_copies();
+        deferred.placed_copies.push(at);
         self.changed_something();
         true
     }
 
-    /// Snapshots a constant buffer immediately after the GPU copy that
-    /// produced it, in the same recording. Other constants keep the normal
-    /// upload path. Only the exact range of the last title-memory copy is
-    /// used, so a later CPU copy cannot be hidden by this snapshot.
+    /// Snapshots a constant at its use in the same recording as its GPU
+    /// producer. A disjoint copy leaves the producer available. An
+    /// overlapping copy must have produced the exact range, and a deferred
+    /// CPU write invalidates the recorded copies.
     pub(crate) fn placed_constant(&self, address: u64, size: usize) -> Option<ID3D12Resource> {
         if size == 0 || size > 64 << 10 || !crate::toggled!("VICTORY_PLACED_CONSTANTS") {
             return None;
@@ -356,10 +357,10 @@ impl HostList {
         let end = src.checked_add(size)?;
         let from = {
             let deferred = self.deferred();
-            let at = deferred.last_placed?;
-            let Step::Placed(copy) = &deferred.copies[at] else {
-                return None;
-            };
+            let (at, copy) = deferred.placed_copies.iter().rev().find_map(|&at| match &deferred.copies[at] {
+                Step::Placed(copy) if copy.dst < end && src < copy.dst.saturating_add(copy.len) => Some((at, copy)),
+                _ => None,
+            })?;
             if copy.dst != src || copy.len != size || copy.from.is_some() {
                 return None;
             }
@@ -435,12 +436,12 @@ mod tests {
 
         let host = host().expect("this test needs a D3D12 device");
         const HEAP: usize = 64 << 10;
-        const SIZE: usize = 560;
+        const SIZE: usize = 240;
         // SAFETY: the allocation belongs to this test, and the registered
         // shadow keeps the range until the end of the test process.
         let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(title, 0);
-        let (src, dst) = (title, title + 4096);
+        let (src, dst, other_dst) = (title, title + 4096, title + 8192);
         let expected: [u8; SIZE] = std::array::from_fn(|i| i.wrapping_mul(7) as u8);
         crate::shadow::register(0x4244, title as u64, HEAP as u64);
         let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
@@ -457,8 +458,9 @@ mod tests {
             wait_for_all(host, &list.list);
         }
         assert!(list.place_copy(dst, src, SIZE));
+        assert!(list.place_copy(other_dst, src, SIZE));
         assert!(list.placed_constant(dst as u64, SIZE - 16).is_none());
-        let snapshot = list.placed_constant(dst as u64, SIZE).expect("the exact range has a GPU snapshot");
+        let snapshot = list.placed_constant(dst as u64, SIZE).expect("a disjoint copy leaves the producer available");
         let (result, mapped) = host.shared_buffer(SIZE as u64).unwrap();
         // SAFETY: the open list retains the snapshot, and the result stays
         // alive and mapped until this synchronous submission completes.
@@ -470,8 +472,11 @@ mod tests {
             )]);
             list.list.CopyBufferRegion(&result, 0, &snapshot, 0, SIZE as u64);
         }
-        list.defer_copy(dst as *mut u8, src as *const u8, SIZE);
+        assert!(list.place_copy(dst + 16, src + 16, SIZE - 16));
         assert!(list.placed_constant(dst as u64, SIZE).is_none());
+        assert!(list.placed_constant(other_dst as u64, SIZE).is_some());
+        list.defer_copy(other_dst as *mut u8, src as *const u8, SIZE);
+        assert!(list.placed_constant(other_dst as u64, SIZE).is_none());
         list.close();
         host.execute_sync_internal(&list);
         // SAFETY: synchronous execution finished the copy and made it visible.
