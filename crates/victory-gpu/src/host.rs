@@ -8059,6 +8059,12 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    tracing::debug!(
+        accepted_ms = (a[11] - a[13]).max(0.0) / 1e6,
+        refused_ms = a[13] / 1e6,
+        allocation_lookup_ms = a[14] / 1e6,
+        "write-watch cost per frame"
+    );
     if e[0] > 0.0 {
         tracing::info!(
             "asked early by a thread of its own per frame: {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",

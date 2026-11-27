@@ -283,8 +283,12 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         } != 0;
         #[cfg(feature = "diagnostics")]
         {
+            let elapsed = started.elapsed().as_nanos() as u64;
             tally(10, u64::from(failed));
-            tally(11, started.elapsed().as_nanos() as u64);
+            tally(11, elapsed);
+            if failed {
+                tally(13, elapsed);
+            }
         }
         if failed {
             return None;
@@ -344,6 +348,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let split_allocations = crate::asked_for!("VICTORY_WATCH_ALLOCATIONS");
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -356,7 +361,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        ask_run(&pieces[i..k], &mut asked, &mut written, split_allocations);
         i = k;
     }
     note_hot(&written);
@@ -632,24 +637,85 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
     crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
 }
 
-/// One kernel asking for `pieces` (page ranges in order); by halves if it
-/// fails, as a run across two reservations or into memory that is not
-/// write-watched does. A piece alone is left to [`writes`]. Adds what was
-/// asked to `asked` and the pages found written to `written`.
-fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+/// One kernel query for sorted page ranges. After a refusal, optionally use
+/// the actual allocation boundaries before falling back to bisection. A
+/// single piece is left to the per-range query.
+fn ask_run(
+    pieces: &[(usize, usize)],
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+    split_allocations: bool,
+) {
     if pieces.len() < 2 {
         return;
     }
     let first = pieces[0].0;
-    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    let last = pieces.iter().map(|p| p.1).max().expect("at least two ranges");
     if let Some(pages) = kernel_written(first, last) {
         written.extend(pages);
         asked.push((first, last));
         return;
     }
+    if split_allocations && ask_within_allocations(pieces, last, asked, written) {
+        return;
+    }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(a, asked, written);
-    ask_run(b, asked, written);
+    ask_run(a, asked, written, false);
+    ask_run(b, asked, written, false);
+}
+
+/// Split a refused batch into ranges within individual Windows memory regions.
+/// This is planning information only. Only a successful write-watch query
+/// publishes coverage. A range that straddles a region or lies in a mapping
+/// still takes the existing per-range path, including its alias guards.
+fn ask_within_allocations(
+    mut pieces: &[(usize, usize)],
+    last: usize,
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut split = false;
+    while let Some(&(first, first_end)) = pieces.first() {
+        if pieces.len() < 2 {
+            break;
+        }
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        #[cfg(feature = "diagnostics")]
+        let begun = std::time::Instant::now();
+        // SAFETY: `first` is a query address, and `info` is a valid output buffer.
+        let found = unsafe { VirtualQuery((first * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        #[cfg(feature = "diagnostics")]
+        tally(14, begun.elapsed().as_nanos() as u64);
+        if found == 0 {
+            if !split {
+                return false;
+            }
+            ask_run(pieces, asked, written, false);
+            break;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE;
+        let private = info.State == MEM_COMMIT && info.Type == MEM_PRIVATE;
+        if !split && private && last <= region_end {
+            // The original query has already covered this homogeneous region.
+            // Preserve the usual fallback for unwatchable private memory.
+            return false;
+        }
+        if first_end > region_end {
+            pieces = &pieces[1..];
+        } else if private {
+            let count = pieces.iter().take_while(|p| p.1 <= region_end).count();
+            ask_run(&pieces[..count], asked, written, false);
+            pieces = &pieces[count..];
+        } else {
+            let count = pieces.partition_point(|p| p.0 < region_end).max(1);
+            pieces = &pieces[count..];
+        }
+        split = true;
+    }
+    split
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -1450,9 +1516,10 @@ fn published(start: usize, end: usize) -> bool {
 /// opened by ourselves; nanoseconds waiting for the guards' lock and
 /// nanoseconds of changing protections (all threads); questions to Windows
 /// about holes; kernel askings refused; nanoseconds in kernel askings; the
-/// 4 KiB pages they found written.
+/// 4 KiB pages they found written; nanoseconds in refused queries; and
+/// nanoseconds reading the allocation boundaries of refused batches.
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static ASKS: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
@@ -1461,7 +1528,7 @@ fn tally(what: usize, n: u64) {
 
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 13] {
+pub(crate) fn asks() -> [u64; 15] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -3278,6 +3345,33 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn refused_batch_preserves_writes_across_allocations() {
+        let mut starts = [0; 2];
+        for start in &mut starts {
+            // SAFETY: each query and write in this test stays inside this allocation.
+            *start = unsafe {
+                VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(*start, 0);
+            unsafe { ((*start + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
+        }
+        starts.sort_unstable();
+        let [a, b] = starts.map(|at| at / PAGE);
+        let pieces = [(a, a + 1), (a + 2, a + 3), (b, b + 1), (b + 2, b + 3)];
+        let _hold = Asking::hold_all();
+        let mut asked = Vec::new();
+        let mut written = Vec::new();
+        let split = ask_within_allocations(&pieces, b + 3, &mut asked, &mut written);
+        for start in starts {
+            // SAFETY: only the test-owned allocations are released.
+            unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
+        }
+        assert!(split);
+        assert_eq!(asked, [(a, a + 3), (b, b + 3)]);
+        assert_eq!(written, [(a + 2, 1), (b + 2, 1)]);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
