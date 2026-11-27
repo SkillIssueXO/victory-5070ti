@@ -3840,6 +3840,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod font;
 mod menu;
+pub use menu::key_down as menu_key_down;
 mod panel;
 mod place;
 mod send;
@@ -10627,8 +10628,8 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_KEYDOWN {
-        menu::key_down(wparam.0 as u16, lparam.0 & (1 << 30) != 0);
+    if message == WM_KEYDOWN && menu_key_down(wparam.0 as u16, lparam.0 & (1 << 30) != 0) {
+        return LRESULT(0);
     }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }

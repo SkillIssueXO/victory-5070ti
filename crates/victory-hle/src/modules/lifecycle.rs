@@ -388,6 +388,12 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // SAFETY: the foreground-window query has no arguments.
+    if message == wm::WM_KEYDOWN && unsafe { wm::GetForegroundWindow() == hwnd }
+        && victory_gpu::menu_key_down(wparam as u16, lparam & (1 << 30) != 0)
+    {
+        return 0;
+    }
     if message == wm::WM_SETFOCUS {
         english_input();
     }

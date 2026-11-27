@@ -130,19 +130,22 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
     item.values.iter().position(|(v, _)| *v == value)
 }
 
-static KEYS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+static KEYS: Mutex<Vec<(u16, bool)>> = Mutex::new(Vec::new());
 
 /// Queue menu keys on the window thread so short presses survive a long frame.
-pub(super) fn key_down(vk: u16, repeat: bool) {
-    if !matches!(vk, VK_F1 | VK_F2 | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_RETURN | VK_ESCAPE)
-        || (repeat && !matches!(vk, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT))
-    {
-        return;
+pub fn key_down(vk: u16, repeat: bool) -> bool {
+    let arrow = matches!(vk, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT);
+    let menu_key = vk == VK_F1
+        || (vk == VK_F2 && story_clock::current().is_some())
+        || (Menu::open() && (arrow || matches!(vk, VK_RETURN | VK_ESCAPE)));
+    if !menu_key {
+        return false;
     }
     let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if keys.len() < 32 {
-        keys.push(vk);
+    if keys.len() < 32 && (!repeat || arrow) {
+        keys.push((vk, repeat));
     }
+    true
 }
 
 /// The box's size in pixels.
@@ -426,12 +429,13 @@ impl Menu {
             return;
         }
         let total = ITEMS.len() + ACTIONS.len();
-        for vk in pressed {
+        for (vk, repeat) in pressed {
             let open = Self::open();
             if vk == VK_F2 {
                 if let Some(minutes) = story_clock::current() {
                     self.story_minutes = self.story_minutes.is_none().then_some(minutes as i32);
                     crate::SETTINGS_MENU_OPEN.store(self.story_minutes.is_some(), Ordering::Relaxed);
+                    tracing::info!(open = self.story_minutes.is_some(), "story clock menu toggled");
                     self.note.clear();
                     self.changed = true;
                 }
@@ -447,27 +451,28 @@ impl Menu {
             if !open {
                 continue;
             }
-            if let Some(minutes) = &mut self.story_minutes {
-                let change = match vk {
-                    VK_LEFT => -60,
-                    VK_RIGHT => 60,
-                    VK_DOWN => -1,
-                    VK_UP => 1,
-                    VK_RETURN => {
-                        if story_clock::request(*minutes as u32) {
-                            self.story_minutes = None;
-                            crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed);
-                        } else {
-                            self.note = "CLOCK BUSY. TRY AGAIN.".to_owned();
-                        }
-                        0
+            if let Some(minutes) = self.story_minutes {
+                if vk == VK_RETURN {
+                    if story_clock::request(minutes as u32) {
+                        self.story_minutes = None;
+                        crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed);
+                    } else {
+                        self.note = "CLOCK BUSY. TRY AGAIN.".to_owned();
                     }
-                    _ => 0,
-                };
-                if let Some(minutes) = &mut self.story_minutes {
-                    *minutes = (*minutes + change).rem_euclid(24 * 60);
+                } else {
+                    let change = match vk {
+                        VK_LEFT => -60,
+                        VK_RIGHT => 60,
+                        VK_DOWN => -1,
+                        VK_UP => 1,
+                        _ => 0,
+                    };
+                    self.story_minutes = Some((minutes + change).rem_euclid(24 * 60));
                 }
                 self.changed = true;
+                continue;
+            }
+            if repeat {
                 continue;
             }
             match vk {
