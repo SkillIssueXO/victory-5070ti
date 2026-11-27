@@ -3068,7 +3068,7 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    blocked_by_pending(written, runs, count, |_, _| false)
+    blocked_by_pending(written, runs, count, |_, _| false).map(|(wait, _)| wait)
 }
 
 /// The same check after a submission has assigned some steps to the card.
@@ -3077,7 +3077,7 @@ fn blocked_by_pending(
     runs: &[&HostList],
     count: bool,
     taken: impl Fn(&HostList, usize) -> bool,
-) -> Option<usize> {
+) -> Option<(usize, &'static str)> {
     if written.is_empty() {
         return None;
     }
@@ -3090,17 +3090,18 @@ fn blocked_by_pending(
             }
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if let Some(_read) = copy_blocked(written, dst, src, len) {
+                    if let Some(read) = copy_blocked(written, dst, src, len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            if _read {
+                            if read {
                                 blame("a buffer copy's source", written, src, len);
                             } else {
                                 blame("a buffer copy's destination", written, dst, len);
                             }
                         }
-                        return Some(WHY_READ);
+                        let what = if read { "a CPU buffer copy reads an in-flight write" } else { "a CPU buffer copy overlaps an in-flight write" };
+                        return Some((WHY_READ, what));
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
@@ -3110,7 +3111,7 @@ fn blocked_by_pending(
                             #[cfg(feature = "diagnostics")]
                             blame("a fill of upload memory", written, src, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a CPU upload reads an in-flight write"));
                     }
                 }
                 Step::Texture(staging) => {
@@ -3121,7 +3122,7 @@ fn blocked_by_pending(
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a texture upload reads an in-flight write"));
                     }
                 }
                 &Step::Plane((at, len), _) => {
@@ -3131,10 +3132,10 @@ fn blocked_by_pending(
                             #[cfg(feature = "diagnostics")]
                             blame("a movie plane", written, at, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a movie plane reads an in-flight write"));
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return Some((WHY_RUN, "a host callback must run on the CPU")),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
@@ -3144,14 +3145,17 @@ fn blocked_by_pending(
                             #[cfg(feature = "diagnostics")]
                             blame("a buffer copy at its place", written, p.src, p.len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a recorded copy needs its source staged by the CPU"));
                     }
                 },
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed, taken)).then_some(WHY_READ)
+    if placed.is_empty() {
+        return None;
+    }
+    place::cpu_reader(runs, placed, taken).map(|what| (WHY_READ, what))
 }
 
 /// With flights in the air, after the submission's write-watch asking:

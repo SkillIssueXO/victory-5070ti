@@ -780,9 +780,11 @@ impl Host {
         // a CPU consumer waiting for its destination. The plan only claims
         // steps it can move, so check the steps it would leave behind.
         if does.iter().any(|step| matches!(step, Does::Placed { .. }))
-            && blocked_by_pending(written, runs, false, |list, i| taken.contains(&(std::ptr::from_ref(list) as usize, i))).is_some()
+            && let Some((_, what)) = blocked_by_pending(written, runs, false, |list, i| {
+                taken.contains(&(std::ptr::from_ref(list) as usize, i))
+            })
         {
-            return Err("a step still on the CPU waits on a copy recorded in a list");
+            return Err(what);
         }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
@@ -1445,7 +1447,10 @@ mod tests {
         assert_eq!(blocked_by(&written, &[&list], false), Some(WHY_READ));
         assert_eq!(blocked_by_pending(&written, &[&list], false, taken), None);
         list.defer_host_read(dst, len, || {});
-        assert_eq!(blocked_by_pending(&written, &[&list], false, taken), Some(WHY_READ));
+        assert_eq!(
+            blocked_by_pending(&written, &[&list], false, taken),
+            Some((WHY_READ, "a CPU callback reads a recorded copy's destination")),
+        );
         list.close();
         drop(shadow);
     }

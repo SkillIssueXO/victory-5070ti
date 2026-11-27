@@ -109,24 +109,31 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` that is still done on the CPU reads `ranges`.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>, taken: impl Fn(&HostList, usize) -> bool) -> bool {
+/// The first step that reads a recorded copy's destination on the CPU.
+pub(super) fn cpu_reader(
+    runs: &[&HostList],
+    mut ranges: Vec<(usize, usize)>,
+    taken: impl Fn(&HostList, usize) -> bool,
+) -> Option<&'static str> {
     join_ranges(&mut ranges, []);
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().enumerate().any(|(i, step)| {
+    runs.iter().find_map(|list| {
+        list.deferred().copies.iter().enumerate().find_map(|(i, step)| {
             if taken(list, i) {
-                return false;
+                return None;
             }
             match step {
-                &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
+                &Step::Copy(_, src, len) => touches(&ranges, src, src + len).then_some("a CPU buffer copy reads a recorded copy's destination"),
+                &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len).then_some("a CPU upload reads a recorded copy's destination"),
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    touches(&ranges, at, at + len)
+                    touches(&ranges, at, at + len).then_some("a texture upload reads a recorded copy's destination")
                 }
-                &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
-                Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-                Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-                _ => false,
+                &Step::Plane((at, len), _) =>
+                    touches(&ranges, at, at.saturating_add(len)).then_some("a movie plane reads a recorded copy's destination"),
+                Step::Host(_, (from, to)) => touches(&ranges, *from, *to).then_some("a CPU callback reads a recorded copy's destination"),
+                Step::Placed(p) => (p.from.is_some() && touches(&ranges, p.src, p.src + p.len))
+                    .then_some("a recorded copy stages the destination of another copy on the CPU"),
+                _ => None,
             }
         })
     })
