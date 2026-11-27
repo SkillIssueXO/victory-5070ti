@@ -128,7 +128,8 @@ struct Journal {
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
+    /// from the journal, without another kernel call. Both endpoints
+    /// increase after contained ranges have been removed.
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
@@ -150,6 +151,24 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// Removes only ranges already covered by one other answer. Joining
+/// adjacent or overlapping answers would allow a read that had no single
+/// covering query to skip asking the kernel.
+fn sort_coverage(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable_by_key(|&(first, last)| (first, std::cmp::Reverse(last)));
+    let mut furthest = 0;
+    ranges.retain(|&(_, last)| {
+        let extends = last > furthest;
+        furthest = furthest.max(last);
+        extends
+    });
+}
+
+fn covered(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let before = ranges.partition_point(|&(start, _)| start <= first);
+    before > 0 && ranges[before - 1].1 >= last
+}
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
@@ -366,6 +385,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    sort_coverage(&mut asked);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
@@ -568,13 +588,15 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let sorted = ahead.len();
     let mut written = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !covered(&ahead[..sorted], first, last)
+            && !ahead[sorted..].iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
@@ -582,6 +604,9 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
     }
     note_hot(&written);
+    if ahead.len() > sorted {
+        sort_coverage(&mut ahead);
+    }
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -775,9 +800,7 @@ fn ask_within_allocations(
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covered(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -796,7 +819,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| covered(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -880,7 +903,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !covered(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3358,6 +3381,23 @@ pub(crate) mod test_books {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn sorted_coverage_requires_an_individual_answer() {
+        let answers = [(30, 35), (10, 13), (8, 14), (8, 12), (12, 16), (16, 21), (30, 35)];
+        let mut index = answers.to_vec();
+        sort_coverage(&mut index);
+        assert_eq!(index, [(8, 14), (12, 16), (16, 21), (30, 35)]);
+        for first in 0..36 {
+            for last in first + 1..=36 {
+                assert_eq!(
+                    covered(&index, first, last),
+                    answers.iter().any(|&(a, b)| a <= first && last <= b),
+                    "{first}..{last}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
