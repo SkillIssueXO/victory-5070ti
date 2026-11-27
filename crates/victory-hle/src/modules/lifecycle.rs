@@ -153,6 +153,9 @@ static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
 fn capture_mouse(hwnd: HWND, active: bool) {
+    if super::controls::mapped_input_enabled() {
+        return;
+    }
     if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
@@ -186,6 +189,9 @@ fn capture_mouse(hwnd: HWND, active: bool) {
 }
 
 pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
+    if super::controls::mapped_input_enabled() {
+        return None;
+    }
     if !enabled("VICTORY_MOUSE_CAPTURE") { return None; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: sampling and warping serialize with capture/focus messages.

@@ -543,6 +543,12 @@ pub(super) fn keys_as_pad() -> bool {
     SETTINGS.get().is_none_or(|settings| settings.keys_as_pad)
 }
 
+pub(super) fn mapped_input_enabled() -> bool {
+    SETTINGS
+        .get()
+        .is_some_and(|settings| settings.enabled && settings.keys_as_pad)
+}
+
 /// Mouse motion and wheel steps since they were last drained, added from
 /// the host's raw input thread (only while the cursor is captured).
 #[derive(Default)]

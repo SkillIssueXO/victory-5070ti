@@ -1737,7 +1737,9 @@ mod host {
         if got == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE {
             return;
         }
-        if !(cursor::FOCUSED.load(Ordering::Relaxed) && cursor::captured()) {
+        if victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed)
+            || !(cursor::FOCUSED.load(Ordering::Relaxed) && cursor::captured())
+        {
             *wheel = 0;
             return;
         }
@@ -1849,6 +1851,9 @@ mod host {
         }
 
         fn mouse_buttons(&mut self) -> Vec<u8> {
+            if victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
             let captured = cursor::FOCUSED.load(Ordering::Relaxed) && cursor::captured();
             let mut down = Vec::new();
             if captured {
