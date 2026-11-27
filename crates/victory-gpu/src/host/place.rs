@@ -353,7 +353,7 @@ impl HostList {
 
     /// Snapshots a constant at its use in the same recording as its GPU
     /// producer. A disjoint copy leaves the producer available. An
-    /// overlapping copy must have produced the exact range, and a deferred
+    /// overlapping copy must cover the entire read, and a deferred
     /// CPU write invalidates the recorded copies.
     pub(crate) fn placed_constant(&self, address: u64, size: usize) -> Option<ID3D12Resource> {
         if size == 0 || size > 64 << 10 || !crate::toggled!("VICTORY_PLACED_CONSTANTS") {
@@ -367,7 +367,7 @@ impl HostList {
                 Step::Placed(copy) if copy.dst < end && src < copy.dst.saturating_add(copy.len) => Some((at, copy)),
                 _ => None,
             })?;
-            if copy.dst != src || copy.len != size || copy.from.is_some() {
+            if copy.dst > src || end > copy.dst.saturating_add(copy.len) || copy.from.is_some() {
                 return None;
             }
             if deferred.copies[at + 1..].iter().any(|step| {
@@ -443,6 +443,8 @@ mod tests {
         let host = host().expect("this test needs a D3D12 device");
         const HEAP: usize = 64 << 10;
         const SIZE: usize = 240;
+        const PART_OFFSET: usize = 64;
+        const PART_SIZE: usize = 32;
         // SAFETY: the allocation belongs to this test, and the registered
         // shadow keeps the range until the end of the test process.
         let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
@@ -465,18 +467,21 @@ mod tests {
         }
         assert!(list.place_copy(dst, src, SIZE));
         assert!(list.place_copy(other_dst, src, SIZE));
-        assert!(list.placed_constant(dst as u64, SIZE - 16).is_none());
+        assert!(list.placed_constant((dst - 16) as u64, SIZE).is_none());
         let snapshot = list.placed_constant(dst as u64, SIZE).expect("a disjoint copy leaves the producer available");
-        let (result, mapped) = host.shared_buffer(SIZE as u64).unwrap();
+        let part = list
+            .placed_constant((dst + PART_OFFSET) as u64, PART_SIZE)
+            .expect("a fully covered slice has its own GPU snapshot");
+        let (result, mapped) = host.shared_buffer((SIZE + PART_SIZE) as u64).unwrap();
         // SAFETY: the open list retains the snapshot, and the result stays
         // alive and mapped until this synchronous submission completes.
         unsafe {
-            list.list.ResourceBarrier(&[transition(
-                &snapshot,
-                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            list.list.ResourceBarrier(&[
+                transition(&snapshot, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(&part, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            ]);
             list.list.CopyBufferRegion(&result, 0, &snapshot, 0, SIZE as u64);
+            list.list.CopyBufferRegion(&result, SIZE as u64, &part, 0, PART_SIZE as u64);
         }
         assert!(list.place_copy(dst + 16, src + 16, SIZE - 16));
         assert!(list.placed_constant(dst as u64, SIZE).is_none());
@@ -487,6 +492,10 @@ mod tests {
         host.execute_sync_internal(&list);
         // SAFETY: synchronous execution finished the copy and made it visible.
         assert_eq!(unsafe { std::slice::from_raw_parts(mapped, SIZE) }, &expected);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(mapped.add(SIZE), PART_SIZE) },
+            &expected[PART_OFFSET..PART_OFFSET + PART_SIZE]
+        );
         assert_eq!(host.log_messages(), None);
     }
 
