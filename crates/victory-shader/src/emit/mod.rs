@@ -622,6 +622,11 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        let water_transmission = matches!(
+            c.digest,
+            [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+        );
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
@@ -636,14 +641,12 @@ pub fn emit(
         // `CS_CollectTriangles_Meshlets`, groups of 1024, does not fit that way: its own LDS
         // is the host group's whole 32 KiB.)
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-            && matches!(
+            && (water_transmission || matches!(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
-                    | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
-                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
-            )
+            ))
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
@@ -664,7 +667,11 @@ pub fn emit(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // In the water tiles, widening after deep skip removal loses
+                // the reverse volume's UAV stores. The conservative form
+                // reproduces the reference outputs with both wave32 halves.
+                let deep_on = !water_transmission
+                    && std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
