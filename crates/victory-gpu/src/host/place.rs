@@ -116,14 +116,22 @@ pub(super) fn cpu_reader(
     taken: impl Fn(&HostList, usize) -> bool,
 ) -> Option<&'static str> {
     join_ranges(&mut ranges, []);
-    runs.iter().find_map(|list| {
+    #[cfg(feature = "diagnostics")]
+    let mut upload = None;
+    let found = runs.iter().enumerate().find_map(|(_list_at, list)| {
         list.deferred().copies.iter().enumerate().find_map(|(i, step)| {
             if taken(list, i) {
                 return None;
             }
             match step {
                 &Step::Copy(_, src, len) => touches(&ranges, src, src + len).then_some("a CPU buffer copy reads a recorded copy's destination"),
-                &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len).then_some("a CPU upload reads a recorded copy's destination"),
+                Step::Fill(_, src, len, _target) if touches(&ranges, *src, *src + *len) => {
+                    #[cfg(feature = "diagnostics")]
+                    if crate::asked_for!("VICTORY_PLACED_UPLOAD_TRACE") {
+                        upload = Some(((_list_at, i), *src, *len, _target.is_some()));
+                    }
+                    Some("a CPU upload reads a recorded copy's destination")
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     touches(&ranges, at, at + len).then_some("a texture upload reads a recorded copy's destination")
@@ -136,7 +144,46 @@ pub(super) fn cpu_reader(
                 _ => None,
             }
         })
-    })
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some((at, src, len, movable)) = upload {
+        trace_upload(runs, &ranges, at, src, len, movable);
+    }
+    found
+}
+
+#[cfg(feature = "diagnostics")]
+fn trace_upload(
+    runs: &[&HostList],
+    ranges: &[(usize, usize)],
+    reader: (usize, usize),
+    src: usize,
+    len: usize,
+    movable: bool,
+) {
+    use std::sync::Mutex;
+    // Keep a sample of distinct dependency shapes. These repeats otherwise
+    // write the same line once per frame for the life of the game.
+    type Shape = (bool, bool, bool, usize, usize, bool);
+    static LOGGED: Mutex<Vec<Shape>> = Mutex::new(Vec::new());
+    for (list_at, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            let Step::Placed(copy) = step else { continue };
+            if src >= copy.dst + copy.len || copy.dst >= src + len || !touches(ranges, copy.dst, copy.dst + copy.len) {
+                continue;
+            }
+            let after = reader > (list_at, i);
+            let same_list = reader.0 == list_at;
+            let cpu_source = copy.from.is_some();
+            let covers_upload = copy.dst <= src && src + len <= copy.dst + copy.len;
+            let shape = (after, same_list, cpu_source, len, copy.len, movable);
+            let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+            if logged.len() < 16 && !logged.contains(&shape) {
+                logged.push(shape);
+                tracing::info!(after, same_list, cpu_source, movable, covers_upload, bytes = len, copy_bytes = copy.len, "placed copy upload dependency");
+            }
+        }
+    }
 }
 
 /// Everything recorded so far is done, and seen, before what follows.
