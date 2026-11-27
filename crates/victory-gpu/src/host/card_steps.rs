@@ -1637,35 +1637,42 @@ mod tests {
 
     #[test]
     fn queued_constant_uses_the_preceding_lists_gpu_copy() {
+        check_queued_constant(0x4245, 240, 32, 48);
+    }
+
+    #[test]
+    fn queued_constant_copies_the_3424_byte_prefix_reported_in_game() {
+        check_queued_constant(0x4246, 0x11a0, 0, 0xd60);
+    }
+
+    fn check_queued_constant(id: usize, bytes: usize, part_offset: usize, part_bytes: usize) {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let host = host().expect("this test needs a D3D12 device");
         const HEAP: usize = 64 << 10;
-        const BYTES: usize = 240;
-        const PART_OFFSET: usize = 32;
-        const PART_BYTES: usize = 48;
         // SAFETY: the test process owns this allocation, and the registered
         // shadow keeps its address until the process exits.
         let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(title, 0);
-        let (src, dst) = (title, title + 256);
-        let expected: [u8; BYTES] = std::array::from_fn(|i| i.wrapping_mul(11) as u8);
-        crate::shadow::register(0x4245, title as u64, HEAP as u64);
+        let (src, dst) = (title, title + bytes.next_multiple_of(256));
+        let expected: Vec<u8> = (0..bytes).map(|i| i.wrapping_mul(11) as u8).collect();
+        crate::shadow::register(id, title as u64, HEAP as u64);
         let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
-        let (upload, data) = host.shared_buffer(BYTES as u64).unwrap();
-        // SAFETY: the mapped upload contains BYTES bytes and is kept alive.
-        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), data, BYTES) };
+        let (upload, data) = host.shared_buffer(bytes as u64).unwrap();
+        // SAFETY: the mapped upload covers the requested bytes and is kept alive.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), data, bytes) };
         let producer = host.new_list().unwrap();
-        shadow.refresh(&producer, src as u64, BYTES as u64);
-        shadow.gpu_writes(&producer, src as u64, BYTES as u64);
+        shadow.refresh(&producer, src as u64, bytes as u64);
+        shadow.gpu_writes(&producer, src as u64, bytes as u64);
         // SAFETY: the list is open and both buffers cover the copy.
-        unsafe { producer.list.CopyBufferRegion(&shadow.buffer, shadow.offset(src as u64), &upload, 0, BYTES as u64) };
-        assert!(producer.place_copy(dst, src, BYTES));
+        unsafe { producer.list.CopyBufferRegion(&shadow.buffer, shadow.offset(src as u64), &upload, 0, bytes as u64) };
+        assert!(producer.place_copy(dst, src, bytes));
         let consumer = host.new_list().unwrap();
-        let (_, _, scratch) = consumer.scratch_held(BYTES as u64).unwrap();
-        consumer.defer_constants(scratch, dst as *const u8, BYTES, (0, 0));
-        let (_, _, partial) = consumer.scratch_held(PART_BYTES as u64).unwrap();
-        consumer.defer_constants(partial, (dst + PART_OFFSET) as *const u8, PART_BYTES, (0, 1));
-        let written = [(src, src + BYTES)];
+        let (_, _, scratch) = consumer.scratch_held(bytes as u64).unwrap();
+        consumer.defer_constants(scratch, dst as *const u8, bytes, (0, 0));
+        let (_, _, partial) = consumer.scratch_held(part_bytes as u64).unwrap();
+        consumer.defer_constants(partial, (dst + part_offset) as *const u8, part_bytes, (0, 1));
+        let written = [(src, src + bytes)];
         assert_eq!(blocked_by(&written, &[&consumer, &producer], false), None);
         assert_eq!(blocked_by(&written, &[&producer, &consumer], false), Some(WHY_READ));
         assert!(queued_constants(&written, &[&consumer, &producer]).is_empty());
@@ -1673,17 +1680,17 @@ mod tests {
         let constants = queued_constants(&written, &[&producer, &consumer]);
         assert_eq!(constants.len(), 2);
         let prelude = host.record_queued_constants(&constants, &mut HashMap::default()).unwrap().pop().unwrap();
-        let (readback, result) = host.shared_buffer((BYTES + PART_BYTES) as u64).unwrap();
+        let (readback, result) = host.shared_buffer((bytes + part_bytes) as u64).unwrap();
         // SAFETY: the ordered submission keeps all resources alive, and
         // the prelude leaves the intermediate buffer readable by a copy.
         unsafe {
-            consumer.list.CopyBufferRegion(&readback, 0, &prelude.own.between, 0, BYTES as u64);
+            consumer.list.CopyBufferRegion(&readback, 0, &prelude.own.between, 0, bytes as u64);
             consumer.list.CopyBufferRegion(
                 &readback,
-                BYTES as u64,
+                bytes as u64,
                 &prelude.own.between,
-                BYTES.next_multiple_of(256) as u64,
-                PART_BYTES as u64,
+                bytes.next_multiple_of(256) as u64,
+                part_bytes as u64,
             );
         }
         producer.close();
@@ -1698,14 +1705,24 @@ mod tests {
         assert_eq!(boundaries, [1, 2]);
         assert!(std::ptr::eq(lists[0], &producer));
         assert!(std::ptr::eq(lists[2], &consumer));
-        for list in lists {
-            host.execute_sync_internal(list);
+        let commands: Vec<Option<ID3D12CommandList>> = lists.iter().map(|list| Some(list.list.cast().unwrap())).collect();
+        // SAFETY: all lists are closed and their resources remain alive
+        // through the fence. There is no host wait between these lists.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done = CreateEventW(None, false, false, None).unwrap();
+            host.queue.ExecuteCommandLists(&commands);
+            host.queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, done).unwrap();
+            let status = WaitForSingleObject(done, 10000);
+            let _ = CloseHandle(done);
+            assert_eq!(status, WAIT_OBJECT_0);
         }
-        // SAFETY: the consumer finished before the synchronous call returned.
-        assert_eq!(unsafe { std::slice::from_raw_parts(result, BYTES) }, &expected);
+        // SAFETY: the fence shows that all copy commands finished.
+        assert_eq!(unsafe { std::slice::from_raw_parts(result, bytes) }, expected.as_slice());
         assert_eq!(
-            unsafe { std::slice::from_raw_parts(result.add(BYTES), PART_BYTES) },
-            &expected[PART_OFFSET..PART_OFFSET + PART_BYTES]
+            unsafe { std::slice::from_raw_parts(result.add(bytes), part_bytes) },
+            &expected[part_offset..part_offset + part_bytes]
         );
         assert_eq!(host.log_messages(), None);
         taken.landed();
