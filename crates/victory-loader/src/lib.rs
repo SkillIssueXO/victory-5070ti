@@ -33,6 +33,8 @@ mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
+pub mod story_clock;
+#[cfg(windows)]
 mod threads;
 #[cfg(windows)]
 mod thunks;

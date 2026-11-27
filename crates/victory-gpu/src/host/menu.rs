@@ -19,14 +19,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
+use victory_core::story_clock;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::font::{colours, glyph};
 use super::{Host, HostList, transition};
@@ -131,32 +130,19 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
     item.values.iter().position(|(v, _)| *v == value)
 }
 
-/// Keys pressed, gathered on a thread of their own every 10 ms: a frame
-/// lasts 50 ms and more, and a short press would fall between two frames.
-fn keys() -> &'static Mutex<Vec<u16>> {
-    static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
-            const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
-            let mut was = [false; WATCHED.len()];
-            loop {
-                std::thread::sleep(Duration::from_millis(10));
-                let mut process = 0;
-                // SAFETY: plain queries; room for the answer.
-                unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
-                let ours = process == std::process::id();
-                for (i, &vk) in WATCHED.iter().enumerate() {
-                    // SAFETY: a plain query.
-                    let down = ours && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
-                    if down && !was[i] {
-                        keys().lock().unwrap_or_else(|e| e.into_inner()).push(vk);
-                    }
-                    was[i] = down;
-                }
-            }
-        });
-        Mutex::new(Vec::new())
-    })
+static KEYS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// Queue menu keys on the window thread so short presses survive a long frame.
+pub(super) fn key_down(vk: u16, repeat: bool) {
+    if !matches!(vk, VK_F1 | VK_F2 | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_RETURN | VK_ESCAPE)
+        || (repeat && !matches!(vk, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT))
+    {
+        return;
+    }
+    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if keys.len() < 32 {
+        keys.push(vk);
+    }
 }
 
 /// The box's size in pixels.
@@ -264,18 +250,17 @@ pub(super) struct Menu {
     painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
+    story_minutes: Option<i32>,
 }
 
 impl Menu {
     pub(super) fn new() -> Menu {
-        // Start the key thread now: F1 must be seen while the menu is closed.
-        let _ = keys();
         // `VICTORY_MENU_OPEN=1`: shown from the start (to look at it in a run nobody presses keys in).
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, story_minutes: None }
     }
 
     fn open() -> bool {
@@ -283,6 +268,15 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
+        if let Some(minutes) = self.story_minutes {
+            return vec![
+                "STORY MODE                       F2 OR ESC CLOSES".to_owned(),
+                String::new(),
+                format!("SET TIME OF DAY               {:02}:{:02}", minutes / 60, minutes % 60),
+                "LEFT/RIGHT HOUR     DOWN/UP MINUTE     ENTER APPLY".to_owned(),
+                self.note.clone(),
+            ];
+        }
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
@@ -427,20 +421,53 @@ impl Menu {
 
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
-        let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
+        let pressed = std::mem::take(&mut *KEYS.lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
             return;
         }
         let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
             let open = Self::open();
+            if vk == VK_F2 {
+                if let Some(minutes) = story_clock::current() {
+                    self.story_minutes = self.story_minutes.is_none().then_some(minutes as i32);
+                    crate::SETTINGS_MENU_OPEN.store(self.story_minutes.is_some(), Ordering::Relaxed);
+                    self.note.clear();
+                    self.changed = true;
+                }
+                continue;
+            }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
-                crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
+                let was_story = self.story_minutes.take().is_some();
+                crate::SETTINGS_MENU_OPEN.store((!open || was_story) && vk == VK_F1, Ordering::Relaxed);
                 self.note.clear();
                 self.changed = true;
                 continue;
             }
             if !open {
+                continue;
+            }
+            if let Some(minutes) = &mut self.story_minutes {
+                let change = match vk {
+                    VK_LEFT => -60,
+                    VK_RIGHT => 60,
+                    VK_DOWN => -1,
+                    VK_UP => 1,
+                    VK_RETURN => {
+                        if story_clock::request(*minutes as u32) {
+                            self.story_minutes = None;
+                            crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed);
+                        } else {
+                            self.note = "CLOCK BUSY. TRY AGAIN.".to_owned();
+                        }
+                        0
+                    }
+                    _ => 0,
+                };
+                if let Some(minutes) = &mut self.story_minutes {
+                    *minutes = (*minutes + change).rem_euclid(24 * 60);
+                }
+                self.changed = true;
                 continue;
             }
             match vk {
@@ -501,6 +528,7 @@ impl Menu {
         // The whole box in the middle, or of it the first line's part in the corner.
         let (w, h) = match &line {
             Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            None if self.story_minutes.is_some() => (size(scale).0, (5 * CELL.1 + 2 * RIM) * scale),
             None => size(scale),
         };
         let (w, h) = (w.min(width), h.min(height));
@@ -542,7 +570,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, story_minutes: None };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;

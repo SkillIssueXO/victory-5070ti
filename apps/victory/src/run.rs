@@ -317,6 +317,10 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    if std::env::var_os("VICTORY_STORY_CLOCK").is_some_and(|value| value == "1") {
+        // SAFETY: the verified image is still idle and stays loaded through title execution.
+        unsafe { victory_loader::story_clock::install(&image, hash.as_str())? };
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
