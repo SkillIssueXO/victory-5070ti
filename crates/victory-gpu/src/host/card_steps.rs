@@ -93,10 +93,10 @@ pub(super) fn footprint_fills() -> bool {
 pub(super) const MAX_FOOTPRINT_FILL: usize = 256 << 10;
 pub(super) const MAX_FOOTPRINT_UPLOADS_PER_LIST: u64 = 1 << 20;
 
-/// Whether a copy at its place in a list ([`place`]) is only in the way of
-/// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
+/// Whether a copy at its place in a list ([`place`]) can be ordered relative
+/// to other copies moved onto the card (`VICTORY_PLACED_ORDER=1`), and a
+/// submission can be cut behind the copy's list ([`cut_for`]). The fill-only
+/// plan can already keep a read before a later copy. Off:
 /// the case did not come up once in runs submit-1 to submit-3, so it has only
 /// its tests behind it.
 ///
@@ -285,7 +285,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         for &i in &more {
             takes(&does[i])?;
         }
-        return plan_fills(does, more, by_order, behind);
+        return plan_fills(does, more, behind);
     }
     let mut taken = vec![false; does.len()];
     let (mut read, mut written) = (Vec::new(), Vec::new());
@@ -399,7 +399,7 @@ const COPY_NEEDS_STAGE_TWO: &str = "a buffer copy (VICTORY_CARD_STEPS=2 does it 
 
 /// Stage 1 only reads title memory. All fills belong to one level, but a
 /// copy that writes any of their bytes still prevents moving them.
-fn plan_fills(does: &[Does], fills: Vec<usize>, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+fn plan_fills(does: &[Does], fills: Vec<usize>, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     if fills.len() > MOST {
         return Err("too many steps depend on it");
     }
@@ -421,7 +421,7 @@ fn plan_fills(does: &[Does], fills: Vec<usize>, by_order: bool, behind: &mut Opt
                 .copied()
                 .find(|&i| reads_writes(&does[i]).is_some_and(|(read, _)| meet(read, (dst, dst + len))));
             *behind = found.map(|i| (p, i));
-            if !by_order || found.is_some() {
+            if found.is_some() {
                 return Err(BEHIND_PLACED);
             }
         }
@@ -774,6 +774,16 @@ impl Host {
         if chosen.is_empty() {
             return Ok(None);
         }
+        let taken: std::collections::HashSet<_, std::hash::BuildHasherDefault<AddressHash>> =
+            chosen.iter().map(|&(i, _)| steps[i]).collect();
+        // A placed copy can still need a CPU upload of its source, or leave
+        // a CPU consumer waiting for its destination. The plan only claims
+        // steps it can move, so check the steps it would leave behind.
+        if does.iter().any(|step| matches!(step, Does::Placed { .. }))
+            && blocked_by_pending(written, runs, false, |list, i| taken.contains(&(std::ptr::from_ref(list) as usize, i))).is_some()
+        {
+            return Err("a step still on the CPU waits on a copy recorded in a list");
+        }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
             let line = line();
@@ -938,7 +948,7 @@ impl Host {
         spent.end();
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: taken,
             copied,
         }))
     }
@@ -1133,7 +1143,8 @@ mod tests {
         let mut behind = None;
         assert_eq!(plan(&[fill, placed], 1, true, &mut behind), Ok(vec![(0, 0)]));
         assert_eq!(behind, None);
-        assert_eq!(plan(&[fill, placed], 1, false, &mut None), Err(BEHIND_PLACED));
+        assert_eq!(plan(&[fill, placed], 1, false, &mut None), Ok(vec![(0, 0)]));
+        assert_eq!(plan(&[placed, fill], 1, false, &mut None), Err(BEHIND_PLACED));
         assert_eq!(plan(&[placed, fill], 1, true, &mut behind), Err(BEHIND_PLACED));
         assert_eq!(behind, Some((0, 1)));
 
@@ -1410,6 +1421,33 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(dst, BYTES), &expected);
         }
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=1 VICTORY_ORDERED_FOOTPRINT_FILLS=1"]
+    fn a_placed_copy_still_blocks_a_cpu_reader() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        assert!(footprint_fills());
+        let host = host().expect("this test needs a D3D12 device");
+        const HEAP: usize = 64 << 10;
+        // SAFETY: this allocation belongs to the test process and the
+        // registered shadow keeps its address until the process exits.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        crate::shadow::register(0x4242, title as u64, HEAP as u64);
+        let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
+        let list = host.new_list().unwrap();
+        let (src, dst, len) = (title, title + 256, 32);
+        list.upload_footprint(host, dst as *const u8, len).unwrap();
+        assert!(list.place_copy(dst, src, len));
+        let written = [(dst, dst + len)];
+        let taken = |_: &HostList, i| i == 0;
+        assert_eq!(blocked_by(&written, &[&list], false), Some(WHY_READ));
+        assert_eq!(blocked_by_pending(&written, &[&list], false, taken), None);
+        list.defer_host_read(dst, len, || {});
+        assert_eq!(blocked_by_pending(&written, &[&list], false, taken), Some(WHY_READ));
+        list.close();
+        drop(shadow);
     }
 
     /// The whole way, in a process of its own with the relay on:

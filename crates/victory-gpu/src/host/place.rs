@@ -109,20 +109,25 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
+/// Whether a step of `runs` that is still done on the CPU reads `ranges`.
+pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>, taken: impl Fn(&HostList, usize) -> bool) -> bool {
     join_ranges(&mut ranges, []);
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
+        list.deferred().copies.iter().enumerate().any(|(i, step)| {
+            if taken(list, i) {
+                return false;
             }
-            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-            _ => false,
+            match step {
+                &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    touches(&ranges, at, at + len)
+                }
+                &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
+                Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
+                Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
+                _ => false,
+            }
         })
     })
 }

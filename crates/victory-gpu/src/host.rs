@@ -3068,13 +3068,26 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_by_pending(written, runs, count, |_, _| false)
+}
+
+/// The same check after a submission has assigned some steps to the card.
+fn blocked_by_pending(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+    taken: impl Fn(&HostList, usize) -> bool,
+) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
     // Destinations of copies at their place, if a step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if taken(list, i) {
+                continue;
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -3138,7 +3151,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    (!placed.is_empty() && place::read_by(runs, placed, taken)).then_some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
