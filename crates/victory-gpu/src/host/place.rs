@@ -182,7 +182,7 @@ fn trace_upload(
     use std::time::{Duration, Instant};
     // Resample each shape occasionally so startup and warm gameplay can be
     // distinguished without logging every submission.
-    type Shape = (bool, bool, bool, usize, usize, &'static str);
+    type Shape = (bool, bool, bool, bool, usize, usize, &'static str);
     static LOGGED: Mutex<Vec<(Shape, Instant)>> = Mutex::new(Vec::new());
     for (list_at, list) in runs.iter().enumerate() {
         for (i, step) in list.deferred().copies.iter().enumerate() {
@@ -194,7 +194,7 @@ fn trace_upload(
             let same_list = reader.0 == list_at;
             let cpu_source = copy.from.is_some();
             let covers_upload = copy.dst <= src && src + len <= copy.dst + copy.len;
-            let shape = (after, same_list, cpu_source, len, copy.len, target);
+            let shape = (after, same_list, cpu_source, covers_upload, len, copy.len, target);
             let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             let room = logged.len() < 16;
@@ -202,7 +202,13 @@ fn trace_upload(
                 Some((_, last)) if now.duration_since(*last) >= Duration::from_secs(10) => *last = now,
                 Some(_) => continue,
                 None if room => logged.push((shape, now)),
-                None => continue,
+                None => {
+                    let Some(oldest) = logged.iter_mut().min_by_key(|(_, last)| *last) else { continue };
+                    if now.duration_since(oldest.1) < Duration::from_secs(10) {
+                        continue;
+                    }
+                    *oldest = (shape, now);
+                }
             }
             tracing::info!(after, same_list, cpu_source, target, covers_upload, bytes = len, copy_bytes = copy.len, "placed copy upload dependency");
         }

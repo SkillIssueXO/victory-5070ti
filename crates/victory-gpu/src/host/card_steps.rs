@@ -573,8 +573,9 @@ fn queued_constants(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<Queue
                 }
                 Step::Run(_) => return Vec::new(),
                 &Step::Fill(_, src, len, Some(FillTo::Slot(heap, slot))) if (1..=64 << 10).contains(&len) => {
+                    let Some(end) = src.checked_add(len) else { continue };
                     if let Some((_, _, source)) = sources.iter().find(|(producer, (from, to), _)| {
-                        *producer < list_at && *from == src && *to == src + len
+                        *producer < list_at && *from <= src && end <= *to
                     }) {
                         constants.push(QueuedConstant {
                             before: list_at,
@@ -1640,6 +1641,8 @@ mod tests {
         let host = host().expect("this test needs a D3D12 device");
         const HEAP: usize = 64 << 10;
         const BYTES: usize = 240;
+        const PART_OFFSET: usize = 32;
+        const PART_BYTES: usize = 48;
         // SAFETY: the test process owns this allocation, and the registered
         // shadow keeps its address until the process exits.
         let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
@@ -1660,18 +1663,29 @@ mod tests {
         let consumer = host.new_list().unwrap();
         let (_, _, scratch) = consumer.scratch_held(BYTES as u64).unwrap();
         consumer.defer_constants(scratch, dst as *const u8, BYTES, (0, 0));
+        let (_, _, partial) = consumer.scratch_held(PART_BYTES as u64).unwrap();
+        consumer.defer_constants(partial, (dst + PART_OFFSET) as *const u8, PART_BYTES, (0, 1));
         let written = [(src, src + BYTES)];
         assert_eq!(blocked_by(&written, &[&consumer, &producer], false), None);
         assert_eq!(blocked_by(&written, &[&producer, &consumer], false), Some(WHY_READ));
         assert!(queued_constants(&written, &[&consumer, &producer]).is_empty());
         assert!(queued_constants(&written, &[&producer, &consumer, &consumer]).is_empty());
         let constants = queued_constants(&written, &[&producer, &consumer]);
-        assert_eq!(constants.len(), 1);
+        assert_eq!(constants.len(), 2);
         let prelude = host.record_queued_constants(&constants, &mut HashMap::default()).unwrap().pop().unwrap();
-        let (readback, result) = host.shared_buffer(BYTES as u64).unwrap();
+        let (readback, result) = host.shared_buffer((BYTES + PART_BYTES) as u64).unwrap();
         // SAFETY: the ordered submission keeps all resources alive, and
         // the prelude leaves the intermediate buffer readable by a copy.
-        unsafe { consumer.list.CopyBufferRegion(&readback, 0, &prelude.own.between, 0, BYTES as u64) };
+        unsafe {
+            consumer.list.CopyBufferRegion(&readback, 0, &prelude.own.between, 0, BYTES as u64);
+            consumer.list.CopyBufferRegion(
+                &readback,
+                BYTES as u64,
+                &prelude.own.between,
+                BYTES.next_multiple_of(256) as u64,
+                PART_BYTES as u64,
+            );
+        }
         producer.close();
         consumer.close();
         let taken = Taken {
@@ -1689,6 +1703,10 @@ mod tests {
         }
         // SAFETY: the consumer finished before the synchronous call returned.
         assert_eq!(unsafe { std::slice::from_raw_parts(result, BYTES) }, &expected);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(result.add(BYTES), PART_BYTES) },
+            &expected[PART_OFFSET..PART_OFFSET + PART_BYTES]
+        );
         assert_eq!(host.log_messages(), None);
         taken.landed();
     }
