@@ -326,11 +326,12 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("C", &["RS"]),
     ("V", &["View"]),
     ("M", &["View"]),
-    ("Tab", &[]),
+    ("Tab", &["LB"]),
     ("WheelUp", &["DpadLeft"]),
     ("WheelDown", &["DpadRight"]),
     ("MouseLeft", &["RB"]),
-    ("MouseRight", &["LB"]),
+    // The title uses LT for braking and LB for holster and loadout in vehicles.
+    ("MouseRight", &[]),
     ("MouseMiddle", &["RS"]),
     ("Up", &["DpadUp"]),
     ("Down", &["DpadDown"]),
@@ -1126,15 +1127,16 @@ mod tests {
             held(&mut controls, keys)
         };
         let pad = sample(&["W", "MouseRight"]);
-        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        assert_eq!(pad.buttons, 0);
         assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
         let pad = sample(&["S", "MouseRight"]);
-        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        assert_eq!(pad.buttons, 0);
         assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 0.0));
         let pad = sample(&["MouseLeft"]);
         assert_eq!(pad.buttons, RIGHT_SHOULDER);
         assert_eq!(pad.right_trigger, 0.0);
-        assert_eq!(sample(&["LShift", "Tab"]).buttons, 0);
+        assert_eq!(sample(&["LShift"]).buttons, 0);
+        assert_eq!(sample(&["Tab"]).buttons, LEFT_SHOULDER);
         assert_eq!(sample(&["Space"]).buttons, A);
     }
 
@@ -1192,6 +1194,9 @@ mod tests {
         c.feed_with_vehicle(&[vk("W")], &counts, Some(true));
         assert!(c.in_vehicle());
         assert_eq!(c.peek(None).right_trigger, 1.0);
+        c.feed_with_vehicle(&[vk("F")], &counts, Some(true));
+        assert_ne!(c.peek(None).buttons & Y, 0);
+        assert!(c.in_vehicle());
         c.feed_with_vehicle(&[vk("W")], &counts, Some(false));
         assert_eq!(c.peek(None).right_trigger, 0.0);
         assert_eq!(c.peek(None).left_y, 1.0);
@@ -1214,6 +1219,7 @@ mod tests {
     fn prompt_keys_stay_correct_in_both_layouts() {
         let settings = Settings::default();
         assert_eq!(shared_prompt_key(&settings, Output::Button(Y)), Some(b'F'));
+        assert_eq!(shared_prompt_key(&settings, Output::Button(LEFT_SHOULDER)), Some(0x09));
         assert_eq!(shared_prompt_key(&settings, Output::Button(RIGHT_SHOULDER)), None);
     }
 
