@@ -1132,13 +1132,9 @@ extern "system" fn copy_texture_region(
                 // What shaders wrote to it, at this place of the list.
                 Some(buffer) => buffer,
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some(buffer) = list.upload_footprint(host, data, bytes as usize) else {
                         return;
                     };
-                    // The list owns this mapped D3D12 upload buffer. Wine can
-                    // report its address as MEM_FREE, so use the host-upload
-                    // path.
-                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
                     buffer
                 }
             };

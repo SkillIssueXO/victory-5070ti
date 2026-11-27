@@ -7244,6 +7244,28 @@ impl HostList {
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
+    /// Private staging for a deferred buffer-to-texture copy. Only a
+    /// successfully created GPU-writable buffer can be filled on the queue.
+    pub(crate) fn upload_footprint(&self, host: &Host, src: *const u8, size: usize) -> Option<ID3D12Resource> {
+        let eligible = card_steps::footprint_fills()
+            && (1..=card_steps::MAX_FOOTPRINT_FILL).contains(&size)
+            && {
+                let deferred = self.deferred();
+                deferred.uploads.len() < 16
+                    && deferred.upload_bytes.saturating_add(size as u64) <= card_steps::MAX_FOOTPRINT_UPLOADS_PER_LIST
+            };
+        if eligible && let Some((buffer, dst)) = host.shared_buffer(size as u64) {
+            let mut deferred = self.deferred();
+            deferred.hold_upload(buffer.clone(), size as u64);
+            let destination = card_steps::FillTo::Buffer(buffer.clone());
+            deferred.copies.push(Step::Fill(dst as usize, src as usize, size, Some(destination)));
+            return Some(buffer);
+        }
+        let (buffer, dst) = self.upload(host, size as u64)?;
+        self.defer_fill_buffer(&buffer, dst, src, size);
+        Some(buffer)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.

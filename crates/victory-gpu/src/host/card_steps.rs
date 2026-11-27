@@ -83,6 +83,16 @@ pub(super) fn stage() -> u32 {
     })
 }
 
+/// Let stage 1 move standalone texture-footprint fills onto the graphics
+/// queue. Their staging buffers are already private to the recording.
+pub(super) fn footprint_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    stage() == 1 && relay_exact() && *ON.get_or_init(|| crate::switch::on("VICTORY_ORDERED_FOOTPRINT_FILLS"))
+}
+
+pub(super) const MAX_FOOTPRINT_FILL: usize = 256 << 10;
+pub(super) const MAX_FOOTPRINT_UPLOADS_PER_LIST: u64 = 1 << 20;
+
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
 /// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
@@ -258,12 +268,10 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// writes, is of a higher level. Our list does them level by level.
 fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
-        Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
+        Does::Copy { .. } if stage < 2 => Err(COPY_NEEDS_STAGE_TWO),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
         _ => Ok(()),
     };
-    let mut taken = vec![false; does.len()];
-    let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
     for (i, d) in does.iter().enumerate() {
         match *d {
@@ -273,6 +281,14 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
+    if stage == 1 {
+        for &i in &more {
+            takes(&does[i])?;
+        }
+        return plan_fills(does, more, by_order, behind);
+    }
+    let mut taken = vec![false; does.len()];
+    let (mut read, mut written) = (Vec::new(), Vec::new());
     while !more.is_empty() {
         // (Joined once for the round: one by one the 2,800 fills of a frame
         // sorted the ranges each time, 16 ms of the submitting thread.)
@@ -379,6 +395,40 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     Ok(out)
 }
 
+const COPY_NEEDS_STAGE_TWO: &str = "a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)";
+
+/// Stage 1 only reads title memory. All fills belong to one level, but a
+/// copy that writes any of their bytes still prevents moving them.
+fn plan_fills(does: &[Does], fills: Vec<usize>, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+    if fills.len() > MOST {
+        return Err("too many steps depend on it");
+    }
+    if fills.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut read = Vec::new();
+    join_ranges(&mut read, fills.iter().filter_map(|&i| reads_writes(&does[i]).map(|(read, _)| read)));
+    if does.iter().any(|d| matches!(*d, Does::Copy { dst, len, .. } if touches(&read, dst, dst + len))) {
+        return Err(COPY_NEEDS_STAGE_TWO);
+    }
+    for (p, d) in does.iter().enumerate() {
+        if let Does::Placed { dst, len, .. } = *d
+            && touches(&read, dst, dst + len)
+        {
+            let following = fills.partition_point(|&i| i <= p);
+            let found = fills[following..]
+                .iter()
+                .copied()
+                .find(|&i| reads_writes(&does[i]).is_some_and(|(read, _)| meet(read, (dst, dst + len))));
+            *behind = found.map(|i| (p, i));
+            if !by_order || found.is_some() {
+                return Err(BEHIND_PLACED);
+            }
+        }
+    }
+    Ok(fills.into_iter().map(|i| (i, 0)).collect())
+}
+
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
 /// date in `[from, to)`.
 fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
@@ -415,6 +465,7 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
     let mut does = Vec::new();
+    let fill_only = stage() == 1;
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
@@ -446,7 +497,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: at.saturating_add(len),
                     asked: touches(written, at, at.saturating_add(len)),
                 },
-                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                &Step::Host(_, (from, to)) if !fill_only && from < to => Does::Read { from, to, asked: false },
+                // Stage 1 writes no title bytes, so these reads cannot depend on it.
+                Step::Refresh(..) if fill_only => continue,
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
@@ -614,6 +667,7 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// Since the last frame-rate line: fills and copies done on the card, their
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static REFUSALS: Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> = Mutex::new(None);
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -678,9 +732,10 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                let mut refusals = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
+                *refusals.get_or_insert_with(Default::default).entry(why).or_default() += 1;
                 #[cfg(feature = "diagnostics")]
                 refused(why);
-                let _ = why;
                 None
             }
         }
@@ -913,6 +968,10 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let refusals = REFUSALS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    for (reason, count) in refusals.into_iter().flatten() {
+        tracing::info!(reason, per_frame = count as f64 / frames, "ordered fill or copy refused");
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1039,6 +1098,23 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
+    #[test]
+    fn fill_only_plan_retains_cpu_and_placed_copy_dependencies() {
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let fill = fill(2032, 64, true);
+        let mut behind = None;
+        assert_eq!(plan(&[fill, placed], 1, true, &mut behind), Ok(vec![(0, 0)]));
+        assert_eq!(behind, None);
+        assert_eq!(plan(&[fill, placed], 1, false, &mut None), Err(BEHIND_PLACED));
+        assert_eq!(plan(&[placed, fill], 1, true, &mut behind), Err(BEHIND_PLACED));
+        assert_eq!(behind, Some((0, 1)));
+
+        let cpu_copy = copy(2095, 5000, 2, false);
+        assert_eq!(plan(&[placed, fill, cpu_copy], 1, true, &mut None), Err(COPY_NEEDS_STAGE_TWO));
+        let unrelated_copy = copy(2096, 2032, 64, false);
+        assert_eq!(plan(&[unrelated_copy, fill], 1, true, &mut None), Ok(vec![(1, 0)]));
     }
 
     /// Whatever the steps, done level by level (in a level every read
@@ -1208,6 +1284,39 @@ mod tests {
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_CARD_STEPS=1 and VICTORY_ORDERED_FOOTPRINT_FILLS=1"]
+    fn ordered_footprint_staging_is_consumed_after_the_fill() {
+        assert!(footprint_fills());
+        let host = host().expect("this test needs a D3D12 device");
+        let consumer = host.new_list().unwrap();
+        let (source, data) = host.shared_buffer(256).unwrap();
+        let expected: [u8; 256] = std::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        // SAFETY: the mapping has 256 bytes and has no queued users yet.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), data, expected.len()) };
+        let staging = consumer.upload_footprint(host, expected.as_ptr(), expected.len()).unwrap();
+        assert!(matches!(consumer.deferred().copies.last(), Some(Step::Fill(_, _, _, Some(FillTo::Buffer(_))))));
+        let other = host.new_list().unwrap();
+        let oversized = vec![0u8; MAX_FOOTPRINT_FILL + 1];
+        other.upload_footprint(host, oversized.as_ptr(), oversized.len()).unwrap();
+        assert!(matches!(other.deferred().copies.last(), Some(Step::Fill(_, _, _, None))));
+        other.close();
+
+        let own = host.own_list().unwrap();
+        record(true, &own.list.list, &own.between, &[(&source, 0, 0, 256)], &[(&staging, 0, 0, 256)]);
+        own.list.close();
+        let (output, read) = host.shared_buffer(256).unwrap();
+        // The captured staging step was filled by the GPU; suppress its CPU
+        // fill here to test only the graphics queue's producer/consumer order.
+        consumer.deferred().copies.clear();
+        // SAFETY: live buffers of at least 256 bytes and an open command list.
+        unsafe { consumer.list.CopyBufferRegion(&output, 0, &staging, 0, 256) };
+        consumer.close();
+        host.execute(&[&own.list, &consumer]);
+        // SAFETY: execute waited for the consuming copy to finish.
+        assert_eq!(unsafe { std::slice::from_raw_parts(read, 256) }, &expected);
     }
 
     /// The whole way, in a process of its own with the relay on:
