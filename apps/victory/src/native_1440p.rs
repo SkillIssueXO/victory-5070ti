@@ -1,8 +1,8 @@
 //! A 2560x1440 or 1920x1080 SDR display for the supported Series X retail image (GTA VI
 //! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
 //! 2560x1440 and scaled up by its own temporal pass. For the launcher’s
-//! custom Series X resolutions, the image's SDR display mode, temporal scene
-//! scale and the Settings viewport load are
+//! custom Series X resolutions, the image's SDR display modes, scanout
+//! reservation, temporal scene scale and Settings viewport load are
 //! patched before it is mapped: the title presents at the requested resolution, and no
 //! 4K pass runs.
 //!
@@ -11,6 +11,7 @@
 //! against the stock bytes first: another build is refused, not patched.
 
 use anyhow::{Context, Result, ensure};
+use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use victory_hle::streamline::Mode;
 use victory_loader::PreparedImage;
 
@@ -19,6 +20,9 @@ pub(super) const DISPLAY_1440P: [u32; 2] = [2560, 1440];
 pub(super) const DISPLAY_1080P: [u32; 2] = [1920, 1080];
 const SDR_MODE: u32 = 0x0615_c100;
 const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
+const SDR_MODE_1440P: u32 = 0x0615_c0f0;
+const STOCK_SDR_MODE_1440P: [u8; 16] = [0, 10, 0, 0, 160, 5, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
+const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
 
@@ -34,8 +38,34 @@ pub(super) fn prepare(image: &mut PreparedImage, [width, height]: [u32; 2], scen
     mode[..4].copy_from_slice(&width.to_le_bytes());
     mode[4..8].copy_from_slice(&height.to_le_bytes());
 
-    // Keep the stock scanout reservation. The title allocates additional
-    // display resources from this pool after creating the back buffers.
+    // The title considers its 1440p entry independently of the 4K entry.
+    // Cap both entries at the requested size for 1080p, otherwise the
+    // Series X mode selector can allocate 1440p buffers in a 1080p pool.
+    if [width, height] == DISPLAY_1080P {
+        let mode_1440p = field::<16>(image, SDR_MODE_1440P)?;
+        ensure!(*mode_1440p == STOCK_SDR_MODE_1440P, "unexpected secondary Series X SDR mode");
+        mode_1440p[..4].copy_from_slice(&width.to_le_bytes());
+        mode_1440p[4..8].copy_from_slice(&height.to_le_bytes());
+    }
+
+    // Reserve exactly two tiled back buffers rounded up to 2 MiB. The
+    // title checks for both exhaustion and unused space of 2 MiB or more.
+    let texture = Texture::new(&TextureDesc {
+        dimension: Dimension::Tex2d,
+        width,
+        height,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28,
+        samples: 1,
+        swizzle: Swizzle::SW_64KB_D_X,
+    })
+    .map_err(|error| anyhow::anyhow!("custom scanout layout: {error:?}"))?;
+    let pool_size =
+        u32::try_from((texture.size.next_multiple_of(64 * 1024) * 2).next_multiple_of(2 << 20))?;
+    let reservation = field::<5>(image, SCANOUT_RESERVATION)?;
+    ensure!(*reservation == [0xb9, 0, 0, 0, 4], "unexpected Series X scanout reservation");
+    reservation[1..].copy_from_slice(&pool_size.to_le_bytes());
 
     let scale = field::<4>(image, TEMPORAL_SCALE)?;
     ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected Series X temporal scene scale");
@@ -156,11 +186,7 @@ mod tests {
             let load = *field::<8>(&mut image, UI_VIEWPORT_LOAD).unwrap();
             let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
             assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), SDR_MODE);
-            assert_eq!(
-                *field::<5>(&mut image, 0x0247_ad4a).unwrap(),
-                [0xb9, 0, 0, 0, 4],
-                "display changes must preserve the stock scanout pool reservation"
-            );
+            assert_eq!(*field::<16>(&mut image, SDR_MODE_1440P).unwrap(), mode);
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, output, scene).is_err());
         }
