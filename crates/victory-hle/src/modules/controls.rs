@@ -1121,16 +1121,21 @@ mod tests {
 
     #[test]
     fn vehicle_mouse_actions_are_separate_from_driving() {
-        let mut c = controls();
-        held(&mut c, &["F"]);
-        let pad = held(&mut c, &["W", "MouseRight"]);
+        let sample = |keys: &[&str]| {
+            let mut controls = Controls::new(Settings { start_in_vehicle: true, ..linear() });
+            held(&mut controls, keys)
+        };
+        let pad = sample(&["W", "MouseRight"]);
         assert_eq!(pad.buttons, LEFT_SHOULDER);
         assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
-        let pad = held(&mut c, &["MouseLeft"]);
+        let pad = sample(&["S", "MouseRight"]);
+        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 0.0));
+        let pad = sample(&["MouseLeft"]);
         assert_eq!(pad.buttons, RIGHT_SHOULDER);
         assert_eq!(pad.right_trigger, 0.0);
-        assert_eq!(held(&mut c, &["LShift", "Tab"]).buttons, 0);
-        assert_eq!(held(&mut c, &["Space"]).buttons, A);
+        assert_eq!(sample(&["LShift", "Tab"]).buttons, 0);
+        assert_eq!(sample(&["Space"]).buttons, A);
     }
 
     #[test]
