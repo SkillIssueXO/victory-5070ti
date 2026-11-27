@@ -317,8 +317,8 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("D", &["LeftRight"]),
     ("Num8", &["LeftUp"]),
     ("Num5", &["LeftDown"]),
-    ("LShift", &["A"]),
-    ("Space", &["RB"]),
+    ("LShift", &[]),
+    ("Space", &["A"]),
     ("E", &["LS"]),
     ("F", &["Y", "ToggleVehicle"]),
     ("G", &["ToggleVehicle"]),
@@ -326,11 +326,11 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("C", &["RS"]),
     ("V", &["View"]),
     ("M", &["View"]),
-    ("Tab", &["LB"]),
+    ("Tab", &[]),
     ("WheelUp", &["DpadLeft"]),
     ("WheelDown", &["DpadRight"]),
-    ("MouseLeft", &["RT"]),
-    ("MouseRight", &["LT"]),
+    ("MouseLeft", &["RB"]),
+    ("MouseRight", &["LB"]),
     ("MouseMiddle", &["RS"]),
     ("Up", &["DpadUp"]),
     ("Down", &["DpadDown"]),
@@ -1117,6 +1117,20 @@ mod tests {
         );
         let pad = held(&mut controls, &["Num8"]);
         assert_eq!(pad.left_y, 1.0);
+    }
+
+    #[test]
+    fn vehicle_mouse_actions_are_separate_from_driving() {
+        let mut c = controls();
+        held(&mut c, &["F"]);
+        let pad = held(&mut c, &["W", "MouseRight"]);
+        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
+        let pad = held(&mut c, &["MouseLeft"]);
+        assert_eq!(pad.buttons, RIGHT_SHOULDER);
+        assert_eq!(pad.right_trigger, 0.0);
+        assert_eq!(held(&mut c, &["LShift", "Tab"]).buttons, 0);
+        assert_eq!(held(&mut c, &["Space"]).buttons, A);
     }
 
     #[test]
