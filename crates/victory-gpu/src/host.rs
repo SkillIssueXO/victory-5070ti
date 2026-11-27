@@ -2362,6 +2362,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// The last title-memory write, if it was a recorded GPU copy.
+    last_placed: Option<usize>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -2424,6 +2426,7 @@ impl Deferred {
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
+        self.last_placed = None;
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
@@ -3155,7 +3158,7 @@ fn blocked_by_pending(
     if placed.is_empty() {
         return None;
     }
-    place::cpu_reader(runs, placed, taken).map(|what| (WHY_READ, what))
+    place::cpu_reader(runs, written, placed, taken).map(|what| (WHY_READ, what))
 }
 
 /// With flights in the air, after the submission's write-watch asking:

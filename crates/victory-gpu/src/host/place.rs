@@ -112,6 +112,7 @@ pub(super) enum Waits {
 /// The first step that reads a recorded copy's destination on the CPU.
 pub(super) fn cpu_reader(
     runs: &[&HostList],
+    _written: &[(usize, usize)],
     mut ranges: Vec<(usize, usize)>,
     taken: impl Fn(&HostList, usize) -> bool,
 ) -> Option<&'static str> {
@@ -128,7 +129,12 @@ pub(super) fn cpu_reader(
                 Step::Fill(_, src, len, _target) if touches(&ranges, *src, *src + *len) => {
                     #[cfg(feature = "diagnostics")]
                     if crate::asked_for!("VICTORY_PLACED_UPLOAD_TRACE") {
-                        upload = Some(((_list_at, i), *src, *len, _target.is_some()));
+                        let target = match _target {
+                            Some(card_steps::FillTo::Slot(..)) => "constant descriptor",
+                            Some(card_steps::FillTo::Buffer(_)) => "staging buffer",
+                            None => "CPU-only upload",
+                        };
+                        upload = Some(((_list_at, i), *src, *len, target));
                     }
                     Some("a CPU upload reads a recorded copy's destination")
                 }
@@ -146,8 +152,8 @@ pub(super) fn cpu_reader(
         })
     });
     #[cfg(feature = "diagnostics")]
-    if let Some((at, src, len, movable)) = upload {
-        trace_upload(runs, &ranges, at, src, len, movable);
+    if let Some((at, src, len, target)) = upload {
+        trace_upload(runs, _written, at, src, len, target);
     }
     found
 }
@@ -155,33 +161,39 @@ pub(super) fn cpu_reader(
 #[cfg(feature = "diagnostics")]
 fn trace_upload(
     runs: &[&HostList],
-    ranges: &[(usize, usize)],
+    written: &[(usize, usize)],
     reader: (usize, usize),
     src: usize,
     len: usize,
-    movable: bool,
+    target: &'static str,
 ) {
     use std::sync::Mutex;
-    // Keep a sample of distinct dependency shapes. These repeats otherwise
-    // write the same line once per frame for the life of the game.
-    type Shape = (bool, bool, bool, usize, usize, bool);
-    static LOGGED: Mutex<Vec<Shape>> = Mutex::new(Vec::new());
+    use std::time::{Duration, Instant};
+    // Resample each shape occasionally so startup and warm gameplay can be
+    // distinguished without logging every submission.
+    type Shape = (bool, bool, bool, usize, usize, &'static str);
+    static LOGGED: Mutex<Vec<(Shape, Instant)>> = Mutex::new(Vec::new());
     for (list_at, list) in runs.iter().enumerate() {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             let Step::Placed(copy) = step else { continue };
-            if src >= copy.dst + copy.len || copy.dst >= src + len || !touches(ranges, copy.dst, copy.dst + copy.len) {
+            if src >= copy.dst + copy.len || copy.dst >= src + len || !matches!(copy.waits(written), Waits::ForReaders) {
                 continue;
             }
             let after = reader > (list_at, i);
             let same_list = reader.0 == list_at;
             let cpu_source = copy.from.is_some();
             let covers_upload = copy.dst <= src && src + len <= copy.dst + copy.len;
-            let shape = (after, same_list, cpu_source, len, copy.len, movable);
+            let shape = (after, same_list, cpu_source, len, copy.len, target);
             let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-            if logged.len() < 16 && !logged.contains(&shape) {
-                logged.push(shape);
-                tracing::info!(after, same_list, cpu_source, movable, covers_upload, bytes = len, copy_bytes = copy.len, "placed copy upload dependency");
+            let now = Instant::now();
+            let room = logged.len() < 16;
+            match logged.iter_mut().find(|(known, _)| *known == shape) {
+                Some((_, last)) if now.duration_since(*last) >= Duration::from_secs(10) => *last = now,
+                Some(_) => continue,
+                None if room => logged.push((shape, now)),
+                None => continue,
             }
+            tracing::info!(after, same_list, cpu_source, target, covers_upload, bytes = len, copy_bytes = copy.len, "placed copy upload dependency");
         }
     }
 }
@@ -316,8 +328,60 @@ impl HostList {
             from: scratch.map(|s| s.2 as usize),
         }));
         deferred.title_written();
+        deferred.last_placed = Some(deferred.copies.len() - 1);
         self.changed_something();
         true
+    }
+
+    /// Snapshots a constant buffer immediately after the GPU copy that
+    /// produced it, in the same recording. Other constants keep the normal
+    /// upload path. Only the exact range of the last title-memory copy is
+    /// used, so a later CPU copy cannot be hidden by this snapshot.
+    pub(crate) fn placed_constant(&self, address: u64, size: usize) -> Option<ID3D12Resource> {
+        if size == 0 || size > 64 << 10 || !crate::toggled!("VICTORY_PLACED_CONSTANTS") {
+            return None;
+        }
+        let src = usize::try_from(address).ok()?;
+        let end = src.checked_add(size)?;
+        let from = {
+            let deferred = self.deferred();
+            let at = deferred.last_placed?;
+            let Step::Placed(copy) = &deferred.copies[at] else {
+                return None;
+            };
+            if copy.dst != src || copy.len != size || copy.from.is_some() {
+                return None;
+            }
+            if deferred.copies[at + 1..].iter().any(|step| {
+                matches!(step, Step::GpuWrite(shadow, from, len)
+                    if *from < end && src < from.saturating_add(*len)
+                        && !std::sync::Arc::ptr_eq(shadow, &copy.shadow))
+            }) {
+                return None;
+            }
+            copy.shadow.clone()
+        };
+        let host = host()?;
+        let buffer = self.between(host, size as u64)?;
+        // SAFETY: the recording is open, the list keeps both buffers, and
+        // the matching copy proved the source range lies in its shadow.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&buffer, 0, &from.buffer, from.offset(address), size as u64);
+            self.list.ResourceBarrier(&[transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::asked_for!("VICTORY_PLACED_UPLOAD_TRACE") {
+            static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if RECORDED.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(bytes = size, "constant upload snapshot recorded after the placed GPU copy");
+            }
+        }
+        Some(buffer)
     }
 
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
@@ -353,6 +417,57 @@ impl HostList {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_later_constant_reads_the_placed_copy_in_the_same_list() {
+        use super::*;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+        let host = host().expect("this test needs a D3D12 device");
+        const HEAP: usize = 64 << 10;
+        const SIZE: usize = 560;
+        // SAFETY: the allocation belongs to this test, and the registered
+        // shadow keeps the range until the end of the test process.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        let (src, dst) = (title, title + 4096);
+        let expected: [u8; SIZE] = std::array::from_fn(|i| i.wrapping_mul(7) as u8);
+        crate::shadow::register(0x4244, title as u64, HEAP as u64);
+        let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
+        let list = host.new_list().unwrap();
+        assert!(list.placed_constant(dst as u64, SIZE).is_none());
+        let (upload, bytes) = host.shared_buffer(SIZE as u64).unwrap();
+        // SAFETY: the upload is mapped and retained through this submission.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), bytes, SIZE) };
+        shadow.refresh(&list, src as u64, SIZE as u64);
+        shadow.gpu_writes(&list, src as u64, SIZE as u64);
+        // SAFETY: both buffers are kept live below, and the recording is open.
+        unsafe {
+            list.list.CopyBufferRegion(&shadow.buffer, shadow.offset(src as u64), &upload, 0, SIZE as u64);
+            wait_for_all(host, &list.list);
+        }
+        assert!(list.place_copy(dst, src, SIZE));
+        assert!(list.placed_constant(dst as u64, SIZE - 16).is_none());
+        let snapshot = list.placed_constant(dst as u64, SIZE).expect("the exact range has a GPU snapshot");
+        let (result, mapped) = host.shared_buffer(SIZE as u64).unwrap();
+        // SAFETY: the open list retains the snapshot, and the result stays
+        // alive and mapped until this synchronous submission completes.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &snapshot,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&result, 0, &snapshot, 0, SIZE as u64);
+        }
+        list.defer_copy(dst as *mut u8, src as *const u8, SIZE);
+        assert!(list.placed_constant(dst as u64, SIZE).is_none());
+        list.close();
+        host.execute_sync_internal(&list);
+        // SAFETY: synchronous execution finished the copy and made it visible.
+        assert_eq!(unsafe { std::slice::from_raw_parts(mapped, SIZE) }, &expected);
+        assert_eq!(host.log_messages(), None);
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
