@@ -9971,8 +9971,6 @@ impl Host {
             };
             p.panel.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
             if composed {
                 list.ResourceBarrier(&[transition(
                     &back,
@@ -10026,7 +10024,14 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if result.0 == 0 {
+                tracing::debug!(
+                    target: "victory_gpu::frame",
+                    token = frame,
+                    "swap chain accepted present"
+                );
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
