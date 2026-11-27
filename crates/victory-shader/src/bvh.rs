@@ -127,7 +127,9 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
         4 => boxes(&children(words), &boxes16(words), ray, sort),
         5 => boxes(&children(words), &boxes32(words), ray, sort),
         k @ 0..=3 => triangle(&triangle_vertices(words, k), ray).map(f32::to_bits),
-        _ => MISS.map(f32::to_bits),
+        // The hardware marks instance and procedural nodes for the traversal
+        // to handle. See AMD GPURT's IntersectCommon.hlsl.
+        _ => USER_DEFINED_NODE,
     }
 }
 
@@ -218,6 +220,8 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
 
 /// What a triangle the ray misses returns.
 pub const MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
+
+pub(crate) const USER_DEFINED_NODE: [u32; 4] = [u32::MAX; 4];
 
 /// The triangle test: the hit distance's numerator, the denominator, and
 /// the numerators of the weights of vertices 1 and 2; [`MISS`] otherwise.
@@ -664,11 +668,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn instances_and_procedural_nodes_return_a_triangle_miss() {
+    fn instances_and_procedural_nodes_return_all_ones() {
         let node = triangles(&TRIANGLE, 9);
         let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
         for k in [6, 7] {
-            assert_eq!(intersect(&node, k, &ray, true), MISS.map(f32::to_bits));
+            assert_eq!(intersect(&node, k, &ray, true), [u32::MAX; 4]);
         }
     }
 

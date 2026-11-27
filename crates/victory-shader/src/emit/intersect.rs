@@ -199,9 +199,8 @@ impl<'a> Lower<'a> {
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
-        // Kinds 6 and 7 (an instance, a procedural primitive): not known
-        // what the console returns; the title's programs do not read it.
-        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        // The traversal handles instance and procedural nodes itself.
+        let other = bvh::USER_DEFINED_NODE.map(|bits| self.s.m.i32(bits));
         let i32t = self.s.t.i32;
         let mut results = Vec::with_capacity(4);
         for k in 0..4 {
