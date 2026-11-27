@@ -4827,24 +4827,30 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
-    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
-    /// it patches the image for it): the frontend's last triangle is drawn
+    /// With a custom Series X output, the frontend's last triangle is drawn
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// the projection lands on the selected output. The scissor and target
+    /// keep their original sizes. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1"))
-            || self.depth != 0
-        {
+        static OUTPUT: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        let &(width, height) = OUTPUT.get_or_init(|| {
+            if std::env::var_os("VICTORY_NATIVE_1080P").is_some_and(|value| value == "1") {
+                Some((1920.0, 1080.0))
+            } else if std::env::var_os("VICTORY_NATIVE_1440P").is_some_and(|value| value == "1") {
+                Some((2560.0, 1440.0))
+            } else {
+                None
+            }
+        }).as_ref()?;
+        if self.depth != 0 {
             return None;
         }
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, width, height) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;

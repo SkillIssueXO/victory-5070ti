@@ -91,7 +91,7 @@ const KEPT: &[&str] = &[
     "VICTORY_LOG",
 ];
 
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
+const RESOLUTIONS: [&str; 4] = ["1440", "1080", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
 
 #[derive(clap::Args, Clone, Debug)]
@@ -102,7 +102,7 @@ pub(crate) struct Play {
     /// The Series S profile (1280x720 inside: faster, softer).
     #[arg(long)]
     series_s: bool,
-    /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
+    /// 1440: 2560x1440 output; 1080: 1920x1080 output; 1080to1440: scene 1920x1080
     /// upscaled by the title; 4k: the stock 3840x2160 output.
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
@@ -187,6 +187,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     if !series_s {
         match res {
             "1440" => set("VICTORY_NATIVE_1440P", "1"),
+            "1080" => set("VICTORY_NATIVE_1080P", "1"),
             "1080to1440" => set("VICTORY_RENDER_1080P", "1"),
             _ => {}
         }
