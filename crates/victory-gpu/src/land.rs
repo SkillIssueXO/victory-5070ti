@@ -115,7 +115,9 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    pub(crate) const RETIRE: usize = 26;
+    pub(crate) const DEBUG_MESSAGES: usize = 27;
+    pub(crate) const COUNT: usize = 28;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -154,7 +156,7 @@ pub(crate) fn log(frames: f64) {
          looking through copies in the PC's memory {:.2} ms beside them and {:.2} ms more; merging what was fetched {:.2} ms \
          ({:.2} ms on all threads, {:.0} jobs), merging the others {:.2} ms ({:.2} on all threads); of the threads' time \
          {:.2} ms waiting for the title's bytes going in, {:.2} ms opening or noting guards; then ranges done with {:.2} ms, \
-         read-backs and lists {:.2}, the title told {:.2}, the rest {:.2}",
+         read-backs and lists {:.2}, the title told {:.2}, the rest {:.2} (retiring resources {:.2} ms, D3D12 messages {:.2} ms)",
         u8::from(on()),
         threads(),
         ms(stat::GATHER),
@@ -171,6 +173,8 @@ pub(crate) fn log(frames: f64) {
         ms(stat::READ_BACKS),
         ms(stat::TOLD),
         ms(stat::REST),
+        ms(stat::RETIRE),
+        ms(stat::DEBUG_MESSAGES),
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \

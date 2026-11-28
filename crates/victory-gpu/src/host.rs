@@ -1997,6 +1997,12 @@ impl<T> Spare<T> {
         Some(self.kept.remove(at).0)
     }
 
+    fn take_or_larger(&mut self, size: u64, fallback: Option<u64>) -> Option<(T, u64)> {
+        self.take(size)
+            .map(|thing| (thing, size))
+            .or_else(|| fallback.and_then(|capacity| self.take(capacity).map(|thing| (thing, capacity))))
+    }
+
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
     /// `most`: then it comes back.
     fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
@@ -2012,24 +2018,23 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk, with its actual size so it can be reused and
+/// accounted for at that size.
+fn take_chunk(host: &Host, size: u64, fallback: Option<u64>) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((chunk, capacity)) = spare.take_or_larger(size, fallback) {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(capacity, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, capacity));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
-        buffer,
-        data: data as usize,
-    })
+    Some((Chunk { buffer, data: data as usize }, size))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -5129,12 +5134,15 @@ impl Host {
                 }
             };
         }
+        stage.next("landing: retiring completed resources");
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
-        stage.next("landing: the rest");
+        let retired = crate::land::spent(crate::land::stat::RETIRE, telling);
+        stage.next("landing: logging D3D12 messages");
         self.log_messages();
+        crate::land::spent(crate::land::stat::DEBUG_MESSAGES, retired);
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
@@ -7387,8 +7395,10 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
-            s.chunks.push((chunk, size));
+            // Reuse a full chunk if the pool has no small chunk, instead
+            // of allocating a new upload resource and later freeing it.
+            let fallback = (size == SCRATCH_FIRST).then_some(SCRATCH_CHUNK);
+            s.chunks.push(take_chunk(host, size, fallback)?);
             s.used = 0;
         }
         let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
@@ -7734,11 +7744,11 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let (chunk, capacity) = take_chunk(host()?, size, None)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
-        deferred.plane_uploads.push((chunk, size));
+        deferred.plane_uploads.push((chunk, capacity));
         deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
         Some(source)
     }
@@ -10753,6 +10763,19 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn scratch_fallback_prefers_exact_size_and_accounts_for_the_larger_chunk() {
+        let mut spare = Spare::new();
+        assert_eq!(spare.give(1, 4, 8), None);
+        assert_eq!(spare.give(2, 1, 8), None);
+        assert_eq!(spare.take_or_larger(1, Some(4)), Some((2, 1)));
+        assert_eq!(spare.take_or_larger(1, None), None);
+        assert_eq!(spare.take_or_larger(1, Some(4)), Some((1, 4)));
+        assert_eq!(spare.bytes, 0);
+        assert_eq!(spare.give(1, 4, 8), None);
+        assert_eq!(spare.take(4), Some(1));
     }
 }
 
